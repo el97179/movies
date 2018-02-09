@@ -1,0 +1,9 @@
+INIT
+- read excel and for all titles get relevant info
+- append that info into the excel
+
+UPDATE
+- run macro when the excel is saved/closed to run the python script and update the excel
+- export the excel into html
+- publish the html to a shared storage
+
