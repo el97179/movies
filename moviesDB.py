@@ -5,8 +5,10 @@ import json
 import requests
 import argparse
 import webbrowser
+import os
 
 key = "d458f62"
+n = 5 # max number of movies retrieved
 title = []
 
 while True:
@@ -31,7 +33,7 @@ while True:
 				continue
 			
 		results = data["Search"]
-		top_n = min(3, int(data["totalResults"]))
+		top_n = min(n, int(data["totalResults"]))
 		print("(top " + str(top_n) + " matching movies)")
 		for i in range(0, top_n):
 			print("\n#" + str(i+1) + ": " + results[i]["Title"] + " (" + results[i]["Year"] + ")")
@@ -57,7 +59,9 @@ while True:
 				for j in range(0, len(film_data["Ratings"])):
 					print("\t" + film_data["Ratings"][j]["Source"] + ": " + film_data["Ratings"][j]["Value"])
 			if (i==0):
-				html_url = results[i]["Title"] + ".html"
+				html_dir = os.path.expanduser('~') + "/Videos/moviesDB/"
+				os.makedirs(html_dir, exist_ok=True)
+				html_url =  html_dir + results[i]["Title"] + ".html"
 				html_file = open(html_url, "w")
 				content = """<!DOCTYPE html>
 							<html>
