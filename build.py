@@ -1,0 +1,1105 @@
+#!/usr/bin/env python3
+"""Scan ~/Videos, fetch details from OMDb, generate a static movies.html.
+
+Usage:
+  export OMDB_API_KEY=<key>      # free key at https://www.omdbapi.com/apikey.aspx
+  python3 build.py               # scan + fetch (cached) + write movies.html
+  python3 build.py --refresh     # ignore cache, re-hit OMDb (costs ~1 call per title)
+  python3 build.py --selftest    # run parser self-checks, no network
+  python3 build.py --no-rename   # don't rename files whose fix was just picked up
+
+Fixing a wrong or missing match:
+  open movies.html, hit the pencil on any card, fill in a title/year or paste an IMDb
+  URL, then "Download fixes". The next run picks the file up from ~/Downloads, applies
+  it, and renames those files to the canonical name (logged to renames.log).
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from difflib import SequenceMatcher
+from pathlib import Path
+
+VIDEOS = Path.home() / "Videos"
+SARONIC_IP = os.environ.get("SARONIC_IP")
+HERE = Path(__file__).parent
+CACHE = HERE / "cache.json"
+CORRECTIONS_FILE = HERE / "corrections.json"
+# ponytail: the browser's default download dir; add a flag if it's ever not this.
+PICKUP = Path.home() / "Downloads" / "corrections.json"
+OUT = VIDEOS / "movies.html"
+
+VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".webm"}
+# Release-tag tokens; first one marks where the real title ends (used when no year).
+JUNK = re.compile(
+    r"\b(1080p|2160p|720p|480p|4k|bluray|brrip|bdrip|webrip|web-dl|webdl|web|hdrip|"
+    r"dvdrip|x264|x265|hevc|h264|h\.264|aac|aac2|dd5|ac3|5\.1|10bit|remux|"
+    r"uncut|screener|hdtv|xvid|repack|proper)\b",
+    re.I,
+)
+YEAR = re.compile(r"\b(19|20)\d\d\b")
+TRACKER = re.compile(r"^\s*www\.\S+\s*-\s*", re.I)
+# `season\s*\d` not `\bseason\b`: "Season1+2" has no word boundary before the digit.
+# Not `seasons?` either -- that would truncate "A Man for All Seasons".
+SERIES = re.compile(
+    r"[\[(]series[\])]|\b(season\s*\d+|complete\s+series|s\d{2})\b", re.I
+)
+# Edition/packaging tags OMDb never carries in a title. Query-side only -- never applied
+# to the parsed title, or "A Complete Unknown" loses a word. `complete` is SERIES' job.
+EDITION = re.compile(
+    r"\b(extended|theatrical|edition|ece|uncut|director'?s?[ .]cut|remastered|"
+    r"collection|trilogy|duology|making[ .]of|a\.?k\.?a\.?)\b",
+    re.I,
+)
+RANGE = re.compile(
+    r"\((19|20)\d\d\s*[-–—]\s*((19|20)\d\d)?\)"
+)  # "(2008-2013)"/"(2022-)" -> series run
+# Our own --rename output: "The-Holiday_(2006)", "Dark_(2017-2020)", "Pluribus_(series)".
+OURS = re.compile(
+    r"^(?P<t>.+?)_\((?P<s>series[_ ])?"
+    r"(?P<y>series|(?:19|20)\d\d(?:\s*[-–—]\s*(?:(?:19|20)\d\d)?)?)\)$",
+    re.I,
+)
+
+
+def parse_name(name):
+    """Raw folder/file name -> (title, year_or_None, type). Heuristic. # ponytail:
+    regex over a personal library; swap in `guessit` only if it gets too noisy."""
+    name = TRACKER.sub("", name)  # drop "www.site.com - " prefix
+    name = re.sub(r"\.[^.]+$", "", name) if "." in name[-5:] else name  # file ext
+
+    m = OURS.match(name)  # already renamed by us -> read it back
+    if m:
+        y = m["y"]
+        # "(series)", "(series_2017)" (a legacy form), or a run "(2008-2013)"
+        series = bool(m["s"]) or y.lower() == "series" or bool(re.search(r"[-–—]", y))
+        return (
+            m["t"].replace("-", " ").strip(),
+            (None if series and not y[:4].isdigit() else y[:4]),
+            ("series" if series else "movie"),
+        )
+
+    # separators first: "Lies_Season1" and "Complete.Series" hide the markers below
+    name = name.replace(".", " ").replace("_", " ")
+    is_series = bool(SERIES.search(name)) or bool(RANGE.search(name))
+    name = SERIES.split(name)[0]  # "Pluribus - Season 1" -> "Pluribus"
+
+    m = YEAR.search(name)
+    if m:
+        year = m.group(0)
+        title = name[: m.start()]
+    else:
+        year = None
+        j = JUNK.search(name)
+        title = name[: j.start()] if j else name
+
+    title = re.sub(r"[\s\-–_([{]+$", "", title)  # trailing separators / open brackets
+    title = re.sub(r"\s+", " ", title).strip(" -–([{")
+    return title, year, ("series" if is_series else "movie")
+
+
+def clean_query(title):
+    """Parsed title -> the string worth asking OMDb about."""
+    if " " not in title and "-" in title:
+        title = title.replace("-", " ")  # our own dash-joined rename output
+    title = EDITION.sub(" ", title)
+    title = re.sub(r"[\[(].*?[\])]", " ", title)  # "[1080p]", "(Downfall)" handled below
+    return re.sub(r"\s+", " ", title).strip(" -–_!.")
+
+
+def search_candidates(title):
+    """Progressively simpler queries, most specific first. Returns (candidates, full)."""
+    full = clean_query(title)
+    out = [full]
+    for seg in re.split(r"\s*[-–—]\s*", full):  # "A.Hitchcock-Vertigo" -> "Vertigo"
+        out.append(seg.strip())
+    m = re.search(r"\((.+?)\)", title)  # "Der Untergang (Downfall)" -> "Downfall"
+    if m:
+        out.append(m.group(1).strip())
+    words = full.split()
+    for n in (1, 2, 3):  # "James Bond Thunderball" -> "Thunderball"
+        if len(words) > n:
+            out.append(" ".join(words[n:]))
+    for n in (1, 2):  # "Its A Wonderful Life" -> "A Wonderful Life" (lost apostrophe)
+        if len(words) > n + 1:
+            out.append(" ".join(words[:-n]))
+    seen, uniq = set(), []
+    for c in out:
+        if c and c.lower() not in seen:
+            seen.add(c.lower())
+            uniq.append(c)
+    return uniq[:7], full
+
+
+def _norm(s):
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", (s or "").lower()).split())
+
+
+def _sim(a, b):
+    return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+
+
+def _year_of(s):
+    return re.sub(r"\D.*$", "", s or "")
+
+
+def pick(results, full, candidate, year, typ):
+    """First search result confident enough to assert, else None.
+
+    Two signals, title and year -- not one tuned threshold. Measured good matches sit at
+    0.80 similarity and measured bad ones at 0.82, so similarity alone cannot separate
+    them. A wrong poster is worse than a blank one: when in doubt, return None.
+    """
+    for r in results:
+        if r.get("Type") != typ:
+            continue
+        ry = _year_of(r.get("Year", ""))
+        yok = (ry.isdigit() and abs(int(ry) - int(year)) <= 1) if year else None
+        sf = _sim(full, r.get("Title", ""))
+        # No year means one signal instead of two, so the title must be near-exact:
+        # "La Casa de Papel" vs "La Casa De Papa" scores .90 and is a different show.
+        if sf >= (0.85 if year else 0.95) and yok is not False:
+            return r
+        # a low-similarity reduced query ("Downfall") needs the year to vouch for it
+        if yok and max(sf, _sim(candidate, r.get("Title", ""))) >= 0.85:
+            return r
+    return None
+
+
+def _entry(name, is_dir, source, watched, base):
+    """Return (raw, title, year, type, source, watched, base) or None if skipped."""
+    if name.startswith(".") or name == "_watched":
+        return None
+    if not is_dir and Path(name).suffix.lower() not in VIDEO_EXT:
+        return None
+    title, year, typ = parse_name(name)
+    if (
+        "/series" in base
+    ):  # a folder under .../series/ is a series, whatever the name says
+        typ = "series"
+    return (name, title, year, typ, source, watched, base) if title else None
+
+
+def remote_listing(path="~/Videos"):
+    """Yield (name, is_dir) for a remote path over SSH. # ponytail: `ls -1p`,
+    the trailing '/' marks dirs; swap to `find` only if subfolders need walking."""
+    if not SARONIC_IP:
+        print("  [WARN] SARONIC_IP not set, skipping Saronic", file=sys.stderr)
+        return
+    try:
+        r = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                SARONIC_IP,
+                f"ls -1p {path}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"  [WARN] NAS ssh {path} failed, skipping: {e}", file=sys.stderr)
+        return
+    if r.returncode == 2:  # `ls`: no such directory -- an absent _watched/ is normal
+        return
+    if r.returncode:
+        print(
+            f"  [WARN] NAS ssh {path} failed, skipping: {r.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return
+    out = r.stdout
+    for line in out.splitlines():
+        if line.strip():
+            yield line.rstrip("/"), line.endswith("/")
+
+
+REMOTE_DIRS = [
+    ("~/Videos/movies", "Saronic", False),
+    ("~/Videos/series", "Saronic", False),
+    ("~/Videos/movies/_watched", "Saronic", True),
+    ("~/Videos/series/_watched", "Saronic", True),
+    ("/volumeUSB1/usbshare/Videos", "WD", False),
+    ("/volumeUSB1/usbshare/Videos/_watched", "WD", True),
+]
+
+
+def scan():
+    """Yield (raw, title, year, type, source, watched, base_dir) per library entry."""
+    for base, watched in ((VIDEOS, False), (VIDEOS / "_watched", True)):
+        if not base.is_dir():
+            continue
+        for child in sorted(base.iterdir()):
+            e = _entry(child.name, child.is_dir(), "Local", watched, str(base))
+            if e:
+                yield e
+    for path, source, watched in REMOTE_DIRS:
+        for name, is_dir in remote_listing(path):
+            e = _entry(name, is_dir, source, watched, path)
+            if e:
+                yield e
+
+
+# Bump when the lookup logic gets smarter: negatives cached by an older, dumber search
+# would otherwise pin those titles as misses forever. See purge_cache().
+SEARCH_V = 2
+NOT_FOUND = {"Response": "False", "Error": "Movie not found!", "v": SEARCH_V}
+
+
+def omdb(title, year, typ, key, cache, refresh, imdb_id=None):
+    ckey = imdb_id if imdb_id else f"{title}|{year or ''}|{typ}"
+    if not refresh and ckey in cache:
+        return cache[ckey]
+    if imdb_id:
+        data = _get({"apikey": key, "i": imdb_id, "plot": "full"})
+    else:
+        data = _lookup(title, year, typ, key)
+    # Only a real answer is worth keeping. A 401/timeout is transient -- caching it once
+    # poisoned 88 entries here, and every later run served the poison instead of retrying.
+    if data.get("Response") == "True":
+        cache[ckey] = data
+    elif not data.get("transient"):
+        cache[ckey] = dict(NOT_FOUND)
+    return data
+
+
+def purge_cache(cache):
+    """Drop cached non-answers. Returns (transient_dropped, outdated_misses_dropped)."""
+    stale = [
+        k
+        for k, v in cache.items()
+        if v.get("Response") != "True" and v.get("Error") != NOT_FOUND["Error"]
+    ]
+    old = [
+        k
+        for k, v in cache.items()
+        if v.get("Error") == NOT_FOUND["Error"] and v.get("v", 0) < SEARCH_V
+    ]
+    for k in stale + old:
+        del cache[k]
+    return len(stale), len(old)
+
+
+def _lookup(title, year, typ, key):
+    """Exact title, then a ladder of simplified search queries behind `pick`."""
+    params = {"apikey": key, "t": title, "plot": "full"}
+    if typ == "series":  # only ever asserted, never guessed -- "movie" is the default
+        params["type"] = typ
+    if year and typ == "movie":
+        params["y"] = year
+    data = _get(params)
+    if data.get("Response") == "False" and "y" in params:  # retry without year
+        params.pop("y")
+        data = _get(params)
+    if data.get("Response") == "True" or data.get("transient"):
+        return data
+
+    cands, full = search_candidates(title)
+    for c in cands:
+        sp = {"apikey": key, "s": c}
+        if typ == "series":
+            sp["type"] = typ
+        res = _get(sp)
+        if res.get("transient"):
+            return res
+        if res.get("Response") != "True":
+            continue
+        hit = pick(res.get("Search", []), full, c, year, typ)
+        if hit:
+            full_rec = _get({"apikey": key, "i": hit["imdbID"], "plot": "full"})
+            if full_rec.get("Response") == "True":
+                return full_rec
+            if full_rec.get("transient"):
+                return full_rec
+    return dict(NOT_FOUND)
+
+
+def _get(params):
+    url = "https://www.omdbapi.com/?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            return json.load(r)
+    except Exception as e:  # network/auth error -> a miss for this run, never cached
+        return {"Response": "False", "Error": str(e), "transient": True}
+
+
+def rt_rating(data):
+    for r in data.get("Ratings", []):
+        if r.get("Source") == "Rotten Tomatoes":
+            return r["Value"]
+    return ""
+
+
+def build_entry(raw, title, year, typ, data, source="Local", watched=False, base=""):
+    matched = data.get("Response") == "True"
+    disp_title = data.get("Title") if matched else title
+    disp_year = (data.get("Year") if matched else year) or ""
+    q = urllib.parse.quote_plus(f"{disp_title} {disp_year} trailer".strip())
+    poster = data.get("Poster", "")
+    span = re.sub(r"[–—]", "-", disp_year)  # OMDb uses an en dash: "2008–2011"
+    return {
+        "title": disp_title,
+        "year": re.sub(r"\D.*$", "", disp_year)
+        or "",  # "2024–" -> "2024", for sort/merge
+        # a series' run: "2008-2013" finished, "2008-" still airing. "" for movies.
+        "years": span if "-" in span else "",
+        "type": (data.get("Type") if matched else typ) or typ,
+        "director": data.get("Director", "") if matched else "",
+        "actors": data.get("Actors", "") if matched else "",
+        "genre": data.get("Genre", "") if matched else "",
+        "imdb": data.get("imdbRating", "") if matched else "",
+        "rt": rt_rating(data) if matched else "",
+        "imdb_url": f"https://www.imdb.com/title/{data['imdbID']}/"
+        if matched and data.get("imdbID")
+        else "",
+        "plot": (data.get("Plot") or "") if matched else "",
+        "runtime": (data.get("Runtime") or "") if matched else "",
+        "seasons": (data.get("totalSeasons") or "") if matched else "",
+        "poster": poster if poster and poster != "N/A" else "",
+        "trailer": f"https://www.youtube.com/results?search_query={q}",
+        "matched": matched,
+        "raw": raw,
+        "sources": [source],
+        "paths": [[source, base, raw]],  # one per physical copy, for --rename
+        "watched": watched,
+    }
+
+
+def merge_duplicates(entries):
+    seen, order = {}, []
+    for e in entries:
+        key = (e["title"].lower(), e["year"])
+        if key not in seen:
+            seen[key] = e
+            order.append(key)
+        else:
+            m = seen[key]
+            for s in e["sources"]:
+                if s not in m["sources"]:
+                    m["sources"].append(s)
+            for p in e["paths"]:
+                if p not in m["paths"]:
+                    m["paths"].append(p)
+            if e["watched"]:
+                m["watched"] = True
+    return [seen[k] for k in order]
+
+
+HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Video Library</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;font:15px/1.4 system-ui,sans-serif;background:#15171c;color:#e8e8e8}
+  header{padding:16px 24px;background:#1d2027;position:sticky;top:0;z-index:5;
+    display:flex;gap:12px;align-items:center;flex-wrap:wrap;border-bottom:1px solid #2c303a}
+  header h1{font-size:18px;margin:0 12px 0 0}
+  input,select,button{font:inherit;padding:7px 10px;border-radius:8px;border:1px solid #363b47;
+    background:#0f1115;color:#e8e8e8}
+  button{cursor:pointer}
+  .count{margin-left:auto;color:#8b93a3;font-size:13px}
+  main{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
+    gap:16px;padding:20px 24px}
+  .card{background:#1d2027;border:1px solid #2c303a;border-radius:12px;overflow:hidden;
+    display:flex;flex-direction:column}
+  .poster{aspect-ratio:2/3;background:#0f1115 center/cover no-repeat;display:flex;
+    align-items:center;justify-content:center;color:#555;font-size:13px;text-align:center;padding:8px;
+    cursor:zoom-in}
+  dialog#zoom{background:#1d2027;color:#e8e8e8;border:1px solid #2c303a;border-radius:12px;
+    padding:0;max-width:640px;width:92vw;max-height:88vh}
+  dialog#zoom::backdrop{background:rgba(0,0,0,.65)}
+  dialog#zoom[open]{display:flex}
+  #zoomBody{display:flex;flex-direction:column;max-height:88vh;overflow:auto;position:relative}
+  #zoomBody .zposter{width:100%;aspect-ratio:2/3;max-height:46vh;background:#0f1115 center/contain no-repeat;
+    display:flex;align-items:center;justify-content:center;color:#555;flex:none}
+  #zoomBody .zinfo{padding:16px 20px;display:flex;flex-direction:column;gap:8px}
+  #zoomClose{position:absolute;top:8px;right:8px;font-size:18px;width:30px;height:30px;
+    border-radius:50%;background:#0f1115;border:1px solid #363b47;color:#e8e8e8;cursor:pointer}
+  .body{padding:12px 14px;display:flex;flex-direction:column;gap:6px;flex:1}
+  .t{font-weight:600;line-height:1.25}
+  .meta{font-size:12px;color:#9aa3b2}
+  .badges{display:flex;gap:6px;flex-wrap:wrap;font-size:12px}
+  .b{padding:2px 7px;border-radius:6px;background:#0f1115;border:1px solid #363b47}
+  .imdb{color:#f5c518;border-color:#5a4d12}
+  .rt{color:#fa320a;border-color:#5a2012}
+  .series{color:#7cc4ff;border-color:#1c4a6e}
+  .nomatch{color:#d98b3a;border-color:#6e4a1c}
+  .loc{color:#8be0a4;border-color:#1c6e3a}
+  .watched-badge{color:#6ee7b7;border-color:#065f46}
+  .card.watched{opacity:.5;filter:grayscale(40%)}
+  .card.watched:hover{opacity:.85;filter:none}
+  a.trailer{margin-top:auto;text-align:center;padding:8px;border-radius:8px;
+    background:#b91c1c;color:#fff;text-decoration:none;font-size:13px}
+  a.trailer:hover{background:#dc2626}
+  .sep{width:1px;height:24px;background:#2c303a;align-self:center}
+  label.cb{display:flex;align-items:center;gap:5px;font-size:13px;cursor:pointer;white-space:nowrap}
+  label.cb input{accent-color:#6ee7b7;width:15px;height:15px;cursor:pointer}
+  .edit-row{display:flex;gap:6px;align-items:center;margin-top:4px}
+  .edit-field{font:inherit;font-size:13px;padding:3px 6px;border-radius:6px;
+    border:1px solid #d98b3a;background:#0f1115;color:#e8e8e8;min-width:0;flex:1}
+  .edit-year{flex:0 0 54px}
+  .edit-box{display:none;flex-direction:column;gap:0}
+  .card.editing .edit-box{display:flex}
+  .card.dirty{outline:1px solid #d98b3a}
+  .pen{background:none;border:0;padding:0 4px;color:#8b93a3;cursor:pointer;font-size:13px}
+  .pen:hover{color:#d98b3a}
+  .t-row{display:flex;align-items:flex-start;gap:4px}
+  .t-row .t{flex:1}
+  #fixes{color:#d98b3a;font-size:13px}
+  details.plot{font-size:12px;color:#9aa3b2;margin-top:2px}
+  details.plot summary{cursor:pointer;color:#7cc4ff;list-style:none;user-select:none}
+  details.plot summary::marker{display:none}
+  details.plot summary::before{content:'▶ Plot'}
+  details[open].plot summary::before{content:'▼ Plot'}
+  details.plot p{margin:6px 0 0;line-height:1.5}
+</style></head><body>
+<header>
+  <h1>🎬 My Video Library</h1>
+  <input id="q" placeholder="Filter by name…" autocomplete="off">
+  <label class="cb"><input type="checkbox" id="cMovies" checked> Movies</label>
+  <label class="cb"><input type="checkbox" id="cSeries" checked> Series</label>
+  <div class="sep"></div>
+  <label class="cb"><input type="checkbox" id="cLocal" checked> Local</label>
+  <label class="cb"><input type="checkbox" id="cSaronic" checked> Saronic</label>
+  <label class="cb"><input type="checkbox" id="cWD" checked> WD</label>
+  <div class="sep"></div>
+  <label class="cb"><input type="checkbox" id="cWatched"> Watched</label>
+  <div class="sep"></div>
+  <select id="sort">
+    <option value="title">Name</option><option value="year">Year</option>
+    <option value="imdb">IMDb rating</option><option value="rt">RT rating</option>
+  </select>
+  <button id="dir" title="Toggle direction">▲ Asc</button>
+  <div class="sep"></div>
+  <span id="fixes"></span>
+  <button id="dl" title="Save corrections.json, then re-run build.py">⬇ Download fixes</button>
+  <button id="cp" title="Copy corrections JSON to clipboard">⧉ Copy</button>
+  <span class="count" id="count"></span>
+</header>
+<main id="grid"></main>
+<dialog id="zoom"><div id="zoomBody"></div></dialog>
+<script>
+const DATA = __DATA__;
+const SAVED = __CORRECTIONS__;   // what corrections.json already holds, from the build
+const grid=document.getElementById('grid'), q=document.getElementById('q'),
+  sortSel=document.getElementById('sort'),
+  dirBtn=document.getElementById('dir'), count=document.getElementById('count'),
+  fixes=document.getElementById('fixes');
+const cMovies=document.getElementById('cMovies'), cSeries=document.getElementById('cSeries'),
+  cLocal=document.getElementById('cLocal'), cSaronic=document.getElementById('cSaronic'),
+  cWD=document.getElementById('cWD'), cWatched=document.getElementById('cWatched');
+const FIELDS=['title','year','imdb_id'];
+// every raw name still present on disk -- a card owns one per physical copy
+const LIVE=new Set(DATA.flatMap(m=>m.paths.map(p=>p[2])));
+// the build extracts tt… from a pasted URL, so compare on that, not the raw text
+const val=(o,f)=>{const v=((o||{})[f]||'').trim();
+  return f==='imdb_id'?(v.match(/tt[0-9]{7,}/)||[''])[0]:v;};
+const same=(a,b)=>FIELDS.every(f=>val(a,f)===val(b,f));
+
+// Draft buffer only. Reconcile on load or it goes stale the moment a fix triggers a
+// rename: a key that no longer exists on disk, or one the build already ingested, would
+// otherwise sit in the pending count forever and get re-injected on every download.
+const drafts={};
+try{
+  const buf=JSON.parse(localStorage.getItem('mov_corrections')||'{}');
+  for(const[k,v]of Object.entries(buf))
+    if(LIVE.has(k)&&!same(v,SAVED[k])) drafts[k]=v;
+}catch{}
+function _save(){
+  localStorage.setItem('mov_corrections',JSON.stringify(drafts));
+  const n=Object.keys(drafts).length;
+  fixes.textContent=n?n+' pending fix'+(n>1?'es':''):'';
+}
+// A merged card covers several files; the correction has to land on all of their names.
+grid.addEventListener('input',e=>{
+  if(!e.target.classList.contains('edit-field'))return;
+  const card=e.target.closest('.card'), raws=JSON.parse(card.dataset.raws);
+  const vals={};
+  card.querySelectorAll('.edit-field').forEach(f=>vals[f.dataset.field]=f.value.trim());
+  for(const r of raws){
+    if(FIELDS.some(f=>vals[f])) drafts[r]={...vals}; else delete drafts[r];
+  }
+  card.classList.toggle('dirty',raws.some(r=>r in drafts));
+  _save();
+});
+grid.addEventListener('click',e=>{
+  if(e.target.classList.contains('pen')){e.target.closest('.card').classList.toggle('editing');return;}
+  if(e.target.closest('.poster')) openZoom(CURRENT_ROWS[+e.target.closest('.card').dataset.i]);
+});
+function payload(){
+  const out={...SAVED};
+  for(const[k,v]of Object.entries(drafts)) out[k]=v;
+  return JSON.stringify(out,null,2);
+}
+document.getElementById('dl').onclick=()=>{
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([payload()],{type:'application/json'}));
+  a.download='corrections.json'; a.click(); URL.revokeObjectURL(a.href);
+};
+document.getElementById('cp').onclick=async e=>{
+  try{await navigator.clipboard.writeText(payload());e.target.textContent='✓ Copied';}
+  catch{e.target.textContent='✗ blocked';}
+  setTimeout(()=>e.target.textContent='⧉ Copy',1500);
+};
+const zoom=document.getElementById('zoom'), zoomBody=document.getElementById('zoomBody');
+let CURRENT_ROWS=[];
+function openZoom(m){
+  const yr=m.years||m.year;
+  zoomBody.innerHTML=`
+    <button id="zoomClose" title="Close">✕</button>
+    <div class="zposter" style="${m.poster?`background-image:url('${esc(m.poster)}')`:''}">${m.poster?'':esc(m.title)}</div>
+    <div class="zinfo">
+      <div class="t" style="font-size:18px">${esc(m.title)} ${yr?`<span class="meta">(${esc(yr)})</span>`:''}</div>
+      ${m.genre?`<div class="meta">${esc(m.genre)}</div>`:''}
+      ${m.runtime&&m.runtime!=='N/A'?`<div class="meta">⏱ ${esc(m.runtime)}</div>`:''}
+      ${m.seasons?`<div class="meta">📺 ${esc(m.seasons)} season${m.seasons!=='1'?'s':''}</div>`:''}
+      ${m.director?`<div class="meta">Dir: ${esc(m.director)}</div>`:''}
+      ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
+      ${m.plot&&m.plot!=='N/A'?`<p style="line-height:1.5">${esc(m.plot)}</p>`:'<p class="meta">No plot available.</p>'}
+      <div style="display:flex;gap:6px">
+        ${m.imdb_url?`<a class="trailer" style="flex:0 0 auto;background:#f5c518;color:#000" href="${esc(m.imdb_url)}" target="_blank" rel="noopener">IMDb</a>`:''}
+        <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">▶ Trailer</a>
+      </div>
+    </div>`;
+  zoomBody.querySelector('#zoomClose').onclick=()=>zoom.close();
+  zoom.showModal();
+}
+zoom.addEventListener('click',e=>{if(e.target===zoom)zoom.close();});  // backdrop click
+let asc=true;
+const num=v=>{const n=parseFloat(v);return isNaN(n)?-1:n};
+function render(){
+  const term=q.value.toLowerCase(), key=sortSel.value;
+  const srcs=new Set([cLocal.checked&&'Local',cSaronic.checked&&'Saronic',cWD.checked&&'WD'].filter(Boolean));
+  let rows=DATA.filter(m=>m.title.toLowerCase().includes(term)
+    &&(m.type==='series'?cSeries.checked:cMovies.checked)
+    &&m.sources.some(s=>srcs.has(s))
+    &&m.watched===cWatched.checked);
+  rows.sort((a,b)=>{
+    let x,y;
+    if(key==='title'){x=a.title.toLowerCase();y=b.title.toLowerCase();return x<y?-1:x>y?1:0;}
+    if(key==='year'){x=num(a.year);y=num(b.year);}
+    else{x=num(a[key]);y=num(b[key]);}
+    return x-y;
+  });
+  if(!asc) rows.reverse();
+  count.textContent=rows.length+' titles';
+  CURRENT_ROWS=rows;
+  grid.innerHTML=rows.map((m,i)=>card(m,i)).join('');
+}
+function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function card(m,i){
+  const poster=m.poster?`style="background-image:url('${esc(m.poster)}')"`:'';
+  const badges=[
+    m.imdb?`<span class="b imdb">IMDb ${esc(m.imdb)}</span>`:'',
+    m.rt?`<span class="b rt">🍅 ${esc(m.rt)}</span>`:'',
+    m.type==='series'?`<span class="b series">Series</span>`:'',
+    !m.matched?`<span class="b nomatch" title="${esc(m.raw)}">no match</span>`:'',
+    ...m.sources.map(s=>`<span class="b loc">📍 ${esc(s)}</span>`),
+    m.watched?`<span class="b watched-badge">✓ Watched</span>`:'',
+  ].join('');
+  const yr=m.years||m.year;
+  const raws=m.paths.map(p=>p[2]);
+  const cur=drafts[m.raw]||SAVED[m.raw]||{};
+  const dirty=raws.some(r=>r in drafts);
+  // every card is editable: a wrong match looks matched, so it needs the same escape hatch
+  const titleHtml=`<div class="t-row">
+      <div class="t">${esc(m.title)} ${yr?`<span class="meta">(${esc(yr)})</span>`:''}</div>
+      <button class="pen" title="Fix this entry">✎</button>
+    </div>
+    <div class="edit-box">
+      <div class="edit-row">
+        <input class="edit-field" data-field="title" value="${esc(cur.title??(m.matched?'':m.title))}" placeholder="title">
+        <input class="edit-field edit-year" data-field="year" value="${esc(cur.year??(m.matched?'':m.year))}" placeholder="year">
+      </div>
+      <div class="edit-row">
+        <input class="edit-field" data-field="imdb_id" value="${esc(cur.imdb_id||'')}" placeholder="IMDb URL or tt… (wins over title)">
+      </div>
+      <div class="meta" style="margin-top:4px">${esc(m.raw)}</div>
+    </div>`;
+  return `<div class="card${m.watched?' watched':''}${!m.matched?' editing':''}${dirty?' dirty':''}"
+      data-raws='${esc(JSON.stringify(raws))}' data-i="${i}">
+    <div class="poster" ${poster}>${m.poster?'':esc(m.title)}</div>
+    <div class="body">
+      ${titleHtml}
+      <div class="badges">${badges}</div>
+      ${m.genre?`<div class="meta">${esc(m.genre)}</div>`:''}
+      ${m.runtime&&m.runtime!=='N/A'?`<div class="meta">⏱ ${esc(m.runtime)}</div>`:''}
+      ${m.seasons?`<div class="meta">📺 ${esc(m.seasons)} season${m.seasons!=='1'?'s':''}</div>`:''}
+      ${m.director?`<div class="meta">Dir: ${esc(m.director)}</div>`:''}
+      ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
+      ${m.plot&&m.plot!=='N/A'?`<details class="plot"><summary></summary><p>${esc(m.plot)}</p></details>`:''}
+      <div style="display:flex;gap:6px;margin-top:auto">
+        ${m.imdb_url?`<a class="trailer" style="flex:0 0 auto;background:#f5c518;color:#000" href="${esc(m.imdb_url)}" target="_blank" rel="noopener">IMDb</a>`:''}
+        <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">▶ Trailer</a>
+      </div>
+    </div></div>`;
+}
+dirBtn.onclick=()=>{asc=!asc;dirBtn.textContent=asc?'▲ Asc':'▼ Desc';render();};
+q.addEventListener('input',render);
+sortSel.addEventListener('input',render);
+[cMovies,cSeries,cLocal,cSaronic,cWD,cWatched].forEach(el=>el.addEventListener('change',render));
+_save();
+render();
+</script></body></html>
+"""
+
+
+def generate(entries, corrections):
+    html = HTML.replace("__DATA__", json.dumps(entries, ensure_ascii=False))
+    html = html.replace("__CORRECTIONS__", json.dumps(corrections, ensure_ascii=False))
+    OUT.write_text(html, encoding="utf-8")
+
+
+IMDB_ID = re.compile(r"tt\d{7,}")
+
+
+def norm_correction(c):
+    """Sanitise one user-entered correction; drop it if it says nothing."""
+    out = {}
+    for f in ("title", "year"):
+        v = (c.get(f) or "").strip()
+        if v:
+            out[f] = v
+    m = IMDB_ID.search(c.get("imdb_id") or "")  # accepts a pasted IMDb URL
+    if m:
+        out["imdb_id"] = m.group(0)
+    if c.get("ignore"):
+        out["ignore"] = True
+    return out
+
+
+def load_corrections():
+    """Read corrections.json, drop entries that only restate what the parser already says.
+
+    Those stubs used to be auto-seeded, and because main() prefers a correction over the
+    parsed title they silently pinned every entry to the old parse -- no parser fix could
+    ever take effect. Only real user intent survives.
+    """
+    if not CORRECTIONS_FILE.exists():
+        return {}
+    raw = json.loads(CORRECTIONS_FILE.read_text())
+    kept, dropped = {}, 0
+    for name, c in raw.items():
+        c = norm_correction(c)
+        if not c:
+            dropped += 1
+            continue
+        if set(c) <= {"title", "year"}:
+            t, y, _ = parse_name(name)
+            # A stub restates the parse, but a rename may have changed the separators
+            # since it was written ("A-Hitchcock-Vertigo" vs "A Hitchcock Vertigo"), and
+            # a parser fix may since have learned to strip what it kept ("...Season1+2").
+            # Run the stub's own title back through the parser and compare normalised.
+            ct = _norm(parse_name(c.get("title", ""))[0])
+            if ct in (_norm(t), "") and c.get("year", "") in ("", y or ""):
+                dropped += 1  # says nothing the parser can't already work out
+                continue
+        kept[name] = c
+    if dropped:
+        print(f"  [info] pruned {dropped} no-op correction(s)")
+    return kept
+
+
+def pickup_corrections(corrections):
+    """Merge a corrections.json downloaded from movies.html. Returns the merged keys."""
+    if not PICKUP.exists():
+        return set()
+    if CORRECTIONS_FILE.exists() and PICKUP.stat().st_mtime <= (
+        CORRECTIONS_FILE.stat().st_mtime
+    ):
+        return set()
+    try:
+        incoming = json.loads(PICKUP.read_text())
+    except (OSError, ValueError) as e:
+        print(f"  [WARN] ignoring {PICKUP}: {e}", file=sys.stderr)
+        return set()
+    merged = set()
+    for name, c in incoming.items():
+        c = norm_correction(c)
+        if c and corrections.get(name) != c:
+            corrections[name] = c
+            merged.add(name)
+    PICKUP.rename(PICKUP.with_suffix(".json.imported"))
+    print(f"  [info] picked up {len(merged)} fix(es) from {PICKUP}")
+    return merged
+
+
+def rq(p):
+    """Quote a remote path, leaving a leading ~/ unquoted so the shell expands it."""
+    return "~/" + shlex.quote(p[2:]) if p.startswith("~/") else shlex.quote(p)
+
+
+def rename_entries(entries, corrections, force=False):
+    def safe(s):
+        s = SERIES.sub("", s)  # "series"/"season" is a tag, never part of the name
+        s = re.sub(r'[/\\:*?"<>|]', "", s).strip(" -–_[({")
+        return re.sub(r"\s+", "-", s)  # "The Holiday" -> "The-Holiday"
+
+    planned, seen_per_dir = [], {}
+    for e in entries:
+        if not e["matched"]:
+            # An unmatched title renames to bare "Monty-Pythons-The-meaning-of-life":
+            # no _(year) suffix, so OURS can't read it back and the spaces are gone for
+            # good. Leave it alone until a lookup or a correction resolves it.
+            continue
+        title = safe(e["title"] or e["raw"])
+        # a finished series gets its full run "(2008-2011)", else the single year
+        span = e.get("years") or e["year"]
+        stem = (
+            f"{title}_({span})"
+            if span
+            else (f"{title}_(series)" if e["type"] == "series" else title)
+        )
+
+        for source, base, raw in e["paths"]:
+            ext = Path(raw).suffix
+            new_name = stem + (
+                ext if ext.lower() in VIDEO_EXT else ""
+            )  # keep file extension
+            seen = seen_per_dir.setdefault(base, set())
+            if raw == new_name:
+                continue
+            if new_name in seen:
+                print(
+                    f"  [WARN] collision: {new_name!r} in {base}, skipping {raw!r}",
+                    file=sys.stderr,
+                )
+                continue
+            if source == "Local":
+                src = Path(base) / raw
+                if not src.exists():
+                    print(f"  [SKIP] not found: {src}", file=sys.stderr)
+                    continue
+                dst = Path(base) / new_name
+                if dst.exists():
+                    print(f"  [WARN] dst exists: {dst}, skipping", file=sys.stderr)
+                    continue
+                planned.append(("local", src, dst, raw, new_name))
+            else:
+                if not SARONIC_IP:
+                    print(
+                        f"  [SKIP] SARONIC_IP not set, skipping {source}",
+                        file=sys.stderr,
+                    )
+                    continue
+                planned.append(
+                    ("remote", f"{base}/{raw}", f"{base}/{new_name}", raw, new_name)
+                )
+            seen.add(new_name)
+
+    if not planned:
+        print("Nothing to rename.")
+        return planned
+
+    for kind, old, new, _, new_name in planned:
+        print(
+            f"  {'[REN]' if force else '[DRY]'} [{kind}] {str(old):70s} -> {new_name!r}"
+        )
+
+    if not force:
+        print(
+            f"\n{len(planned)} rename(s) planned. Re-run with --rename --force to apply."
+        )
+        return planned
+
+    renamed = set()
+    for kind, old, new, old_raw, new_name in planned:
+        if kind == "local":
+            old.rename(new)
+        else:
+            try:
+                assert SARONIC_IP
+                subprocess.run(
+                    [
+                        "ssh",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=10",
+                        SARONIC_IP,
+                        f"mv -n {rq(old)} {rq(new)}",
+                    ],
+                    check=True,
+                    timeout=30,
+                    capture_output=True,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                print(f"  [ERR] {old} -> {new}: {exc}", file=sys.stderr)
+                continue
+        if old_raw not in renamed:
+            renamed.add(old_raw)
+            if old_raw in corrections:  # keep the fix pointing at the new filename
+                corrections[new_name] = corrections.pop(old_raw)
+
+    # An undo trail: a mistyped IMDb id renames real files, and the old name is the
+    # only way back. Append-only, never read by the program.
+    if renamed:
+        with (HERE / "renames.log").open("a", encoding="utf-8") as fh:
+            for kind, old, new, _, _ in planned:
+                fh.write(f"{datetime.now():%F %T}\t{kind}\t{old}\t{new}\n")
+    print(f"\n{len(planned)} rename(s) applied, logged to {HERE / 'renames.log'}.")
+    return planned
+
+
+def _search_selftest():
+    """Ladder + guard, on the real OMDb payloads that motivated them. No network."""
+    for title, want in [
+        ("James Bond Thunderball", "Thunderball"),
+        ("Der Untergang (Downfall)", "Downfall"),
+        ("Its A Wonderful Life", "A Wonderful Life"),
+        ("A.Hitchcock-Vertigo", "Vertigo"),
+        ("The-Lord-of-the-Rings-The-Two-Towers-THEATRICAL-EDITION",
+         "The Lord of the Rings The Two Towers"),
+    ]:
+        cands, _ = search_candidates(title)
+        assert want in cands, (title, cands)
+
+    def r(t, y, ty="movie"):
+        return {"Title": t, "Year": y, "Type": ty, "imdbID": "tt0"}
+
+    # accept: the title agrees, or a reduced query agrees and the year vouches for it
+    ok = [
+        ("James Bond Thunderball", "Thunderball", "1965", [r("Thunderball", "1965")]),
+        ("Its A Wonderful Life", "A Wonderful Life", "1946",
+         [r("It's a Wonderful Life", "1946")]),
+        ("Monty Pythons Life of Brian", "Life of Brian", "",
+         [r("Monty Python's Life of Brian", "1979")]),
+        ("Der Untergang Downfall", "Downfall", "2004", [r("Downfall", "2004")]),
+    ]
+    for full, cand, year, res in ok:
+        assert pick(res, full, cand, year, "movie"), (full, res)
+
+    # reject: every wrong match the ungated version asserted with confidence
+    bad = [
+        ("Tutti pazzi a tel aviv", "tel aviv", "2019",
+         [r("Portrait of a Lady on Fire", "2020")], "movie"),
+        ("Monty Pythons The meaning of life", "life", "", [r("Life", "2017")], "movie"),
+        ("Perfetti Sconosciuti", "Sconosciuti", "2016",
+         [r("I compagni sconosciuti", "2016")], "movie"),
+        ("The Lord of the Rings The Return of the King", "The Return of the King",
+         "2003",
+         [r("The Lord of the Rings: The Return of the King - Special Extended "
+            "Edition Scenes", "2004")], "movie"),
+        ("Severance", "Severance", "", [r("Severance", "2006", "series")], "movie"),
+        # no year to cross-check, and it is a different show
+        ("La Casa de Papel", "La Casa de", "",
+         [r("La Casa De Papa", "2020-2021", "series")], "series"),
+    ]
+    for full, cand, year, res, typ in bad:
+        assert not pick(res, full, cand, year, typ), (full, res)
+
+    # a correction that only restates the parse is a no-op; real intent survives
+    assert norm_correction({"title": "", "year": " ", "imdb_id": ""}) == {}
+    assert norm_correction(
+        {"imdb_id": "https://www.imdb.com/title/tt0118736/"}
+    ) == {"imdb_id": "tt0118736"}
+    assert norm_correction({"title": "Vertigo", "ignore": True}) == {
+        "title": "Vertigo",
+        "ignore": True,
+    }
+
+
+def selftest():
+    global SARONIC_IP
+    SARONIC_IP = SARONIC_IP or "nas.invalid"  # dry run only, never dialled
+    cases = [
+        ("Anora 2024 1080p WEB-DL HEVC x265 5.1 BONE", ("Anora", "2024", "movie")),
+        (
+            "Rental Family 2025 1080p WEB-DL HEVC x265 5.1 BONE.mkv",
+            ("Rental Family", "2025", "movie"),
+        ),
+        ("Pluribus - Season 1", ("Pluribus", None, "series")),
+        ("The.Holiday.2006.1080p.BluRay.x265-RARBG", ("The Holiday", "2006", "movie")),
+        (
+            "www.Torrenting.com   -   Im Still Here A K A Ainda Estou Aqui 2024 PORTUGUESE",
+            ("Im Still Here A K A Ainda Estou Aqui", "2024", "movie"),
+        ),
+        ("Die Hard (1988) [1080p] {5.1}", ("Die Hard", "1988", "movie")),
+        # our own --rename output must round-trip, so a second run is a no-op
+        ("The-Holiday_(2006).mkv", ("The Holiday", "2006", "movie")),
+        ("Pluribus_(series)", ("Pluribus", None, "series")),
+        ("Pluribus [series]", ("Pluribus", None, "series")),  # legacy rename pattern
+        # "Season1" has no word boundary before the digit -- used to parse as a movie
+        ("Big.Little.Lies_Season1+2", ("Big Little Lies", None, "series")),
+        ("Severance-Season1+2", ("Severance", None, "series")),
+        # ...but a title that merely ends in "Seasons" must survive intact
+        ("A Man for All Seasons (1966)", ("A Man for All Seasons", "1966", "movie")),
+        # a legacy rename form still on disk
+        ("Big-Little-Lies_(series_2017)", ("Big Little Lies", "2017", "series")),
+    ]
+    for raw, expect in cases:
+        got = parse_name(raw)
+        assert got == expect, f"\n  {raw!r}\n  got    {got}\n  expect {expect}"
+
+    assert rq("~/Videos/a b") == "~/'Videos/a b'", rq("~/Videos/a b")
+    assert rq("/volumeUSB1/a b") == "'/volumeUSB1/a b'", rq("/volumeUSB1/a b")
+    _search_selftest()
+
+    # dry run: same title on two NASes, one a file (keeps .mkv), one a folder
+    e = build_entry(
+        "The.Holiday.2006.1080p.mkv",
+        "The Holiday",
+        "2006",
+        "movie",
+        {"Response": "True", "Title": "The Holiday", "Year": "2006", "Type": "movie"},
+        "Saronic",
+        False,
+        "~/Videos/movies",
+    )
+    e["paths"].append(["WD", "/volumeUSB1/usbshare/Videos", "The Holiday (2006)"])
+    plan = [(old, new) for _, old, new, _, _ in rename_entries([e], {}, force=False)]
+    assert plan == [
+        (
+            "~/Videos/movies/The.Holiday.2006.1080p.mkv",
+            "~/Videos/movies/The-Holiday_(2006).mkv",
+        ),
+        (
+            "/volumeUSB1/usbshare/Videos/The Holiday (2006)",
+            "/volumeUSB1/usbshare/Videos/The-Holiday_(2006)",
+        ),
+    ], plan
+
+    # finished series -> full run; still-airing -> first year; no year -> (series)
+    def _series(raw, title, year, matched=True):
+        data = (
+            {"Response": "True", "Title": title, "Year": year or "", "Type": "series"}
+            if matched
+            else {"Response": "False"}
+        )
+        return build_entry(
+            raw, title, None, "series", data, "Saronic", False, "~/Videos/series"
+        )
+
+    done = _series("Breaking.Bad.Complete.Series", "Breaking Bad", "2008–2013")
+    airing = _series("Severance.S02", "Severance", "2022–")
+    noyear = _series("Pluribus - Season 1", "Pluribus", None)
+    # a stale correction title carrying the marker must not leak into the filename
+    dirty = _series("Pluribus-[series]_(series)", "Pluribus [series]", None)
+    assert [n for _, _, n, _, _ in rename_entries([dirty], {}, force=False)] == [
+        "~/Videos/series/Pluribus_(series)"
+    ]
+    assert (done["years"], done["year"]) == ("2008-2013", "2008")
+    assert (airing["years"], airing["year"]) == ("2022-", "2022")
+    plan = [
+        new
+        for _, _, new, _, _ in rename_entries([done, airing, noyear], {}, force=False)
+    ]
+    assert plan == [
+        "~/Videos/series/Breaking-Bad_(2008-2013)",
+        "~/Videos/series/Severance_(2022-)",
+        "~/Videos/series/Pluribus_(series)",
+    ], plan
+    # an unmatched entry must never be renamed: "A-B-C" with no _(year) can't round-trip
+    unmatched = _series("Monty-Pythons-The-meaning-of-life", "Monty", None, False)
+    assert rename_entries([unmatched], {}, force=False) == []
+    # our own output must round-trip: dashes back to spaces, so OMDb sees a real title
+    for n, want in [
+        ("Breaking-Bad_(2008-2013)", ("Breaking Bad", "2008", "series")),
+        ("Severance_(2022-)", ("Severance", "2022", "series")),
+        ("Pluribus_(series)", ("Pluribus", None, "series")),
+        ("La-grande-bellezza_(2013)", ("La grande bellezza", "2013", "movie")),
+        ("Mulholland-Dr._(1999).mkv", ("Mulholland Dr.", "1999", "movie")),
+    ]:
+        assert parse_name(n) == want, (n, parse_name(n))
+    print(f"selftest: {len(cases)} cases passed")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--refresh", action="store_true", help="ignore cache")
+    ap.add_argument(
+        "--selftest", action="store_true", help="run parser checks, no network"
+    )
+    ap.add_argument(
+        "--rename",
+        action="store_true",
+        help="rename to <Title>_(<year>) pattern (dry run by default)",
+    )
+    ap.add_argument("--force", action="store_true", help="with --rename: apply changes")
+    ap.add_argument(
+        "--no-rename",
+        action="store_true",
+        help="don't auto-rename files whose fix was just picked up",
+    )
+    args = ap.parse_args()
+    if args.selftest:
+        selftest()
+        return
+
+    key = os.environ.get("OMDB_API_KEY")
+    if not key:
+        sys.exit(
+            "OMDB_API_KEY not set. Get a free key at https://www.omdbapi.com/apikey.aspx"
+        )
+    if not VIDEOS.is_dir():
+        sys.exit(f"No such folder: {VIDEOS}")
+
+    corrections = load_corrections()
+    fixed_now = pickup_corrections(corrections)
+    cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
+    stale, old = purge_cache(cache)
+    if stale:
+        print(f"  [info] purged {stale} transient error(s) cached by an older build")
+    if old:
+        print(f"  [info] retrying {old} miss(es) recorded before the current search")
+
+    entries = []
+    for raw, title, year, typ, source, watched, base in scan():
+        corr = corrections.get(raw, {})
+        if corr.get("ignore"):
+            continue
+        title = corr.get("title") or title
+        year = corr.get("year") or year
+        imdb_id = corr.get("imdb_id")
+        data = omdb(title, year, typ, key, cache, args.refresh, imdb_id=imdb_id)
+        ok = data.get("Response") == "True"
+        tag = " OK " if ok else ("ERR " if data.get("transient") else "MISS")
+        print(
+            f"  [{tag}] {title} [{typ}] [{source}]{' [watched]' if watched else ''}"
+            + (f" -- {data.get('Error')}" if data.get("transient") else "")
+        )
+        entries.append(build_entry(raw, title, year, typ, data, source, watched, base))
+    CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+    entries = merge_duplicates(entries)
+
+    if args.rename:
+        rename_entries(entries, corrections, force=args.force)
+        CORRECTIONS_FILE.write_text(json.dumps(corrections, ensure_ascii=False, indent=2))
+        return
+    # Only the fixes that arrived in this run's pickup get renamed. Anything broader
+    # would sweep the whole back catalogue of hand-edited corrections into an
+    # irreversible mass rename across Local, Saronic and WD the first time it ran.
+    just_fixed = [
+        e
+        for e in entries
+        if e["matched"] and any(p[2] in fixed_now for p in e["paths"])
+    ]
+    if just_fixed and not args.no_rename:
+        print(f"\nRenaming {len(just_fixed)} just-fixed title(s):")
+        done = rename_entries(just_fixed, corrections, force=True)
+        moved = {old_raw: new_name for _, _, _, old_raw, new_name in done}
+        for e in just_fixed:  # so the page reports the names now on disk
+            for p in e["paths"]:
+                p[2] = moved.get(p[2], p[2])
+            e["raw"] = moved.get(e["raw"], e["raw"])
+    CORRECTIONS_FILE.write_text(json.dumps(corrections, ensure_ascii=False, indent=2))
+
+    generate(entries, corrections)
+    matched = sum(e["matched"] for e in entries)
+    print(f"\n{len(entries)} titles ({matched} matched) -> {OUT}")
+
+
+if __name__ == "__main__":
+    main()
