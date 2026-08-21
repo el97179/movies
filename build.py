@@ -467,7 +467,7 @@ HTML = """<!doctype html>
 </style></head><body>
 <header>
   <h1>🎬 My Video Library</h1>
-  <input id="q" placeholder="Filter by name…" autocomplete="off">
+  <input id="q" placeholder="Filter by name, actor, director…" autocomplete="off">
   <label class="cb"><input type="checkbox" id="cMovies" checked> Movies</label>
   <label class="cb"><input type="checkbox" id="cSeries" checked> Series</label>
   <div class="sep"></div>
@@ -582,7 +582,7 @@ const num=v=>{const n=parseFloat(v);return isNaN(n)?-1:n};
 function render(){
   const term=q.value.toLowerCase(), key=sortSel.value;
   const srcs=new Set([cLocal.checked&&'Local',cSaronic.checked&&'Saronic',cWD.checked&&'WD'].filter(Boolean));
-  let rows=DATA.filter(m=>m.title.toLowerCase().includes(term)
+  let rows=DATA.filter(m=>(m.title+' '+m.director+' '+m.actors).toLowerCase().includes(term)
     &&(m.type==='series'?cSeries.checked:cMovies.checked)
     &&m.sources.some(s=>srcs.has(s))
     &&m.watched===cWatched.checked);
