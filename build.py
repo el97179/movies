@@ -280,7 +280,7 @@ def scan():
 
 # Bump when the lookup logic gets smarter: negatives cached by an older, dumber search
 # would otherwise pin those titles as misses forever. See purge_cache().
-SEARCH_V = 2
+SEARCH_V = 3
 NOT_FOUND = {"Response": "False", "Error": "Movie not found!", "v": SEARCH_V}
 
 
@@ -325,14 +325,23 @@ def _lookup(title, year, typ, key):
         params["type"] = typ
     if year and typ == "movie":
         params["y"] = year
-    data = _get(params)
-    if data.get("Response") == "False" and "y" in params:  # retry without year
-        params.pop("y")
-        data = _get(params)
-    if data.get("Response") == "True" or data.get("transient"):
-        return data
-
     cands, full = search_candidates(title)
+    # `t=` is fuzzy: "Goldfinger" 1964 answers with a set-visit short, and with `y=` it
+    # prefers any same-year junk ("It's A Wonderful Life (1946)", no votes). Vet each
+    # answer like a search hit, then retry without the year, then fall back to search.
+    while True:
+        data = _get(params)
+        if data.get("transient"):
+            return data
+        if data.get("Response") == "True" and data.get("imdbVotes") != "N/A":
+            ry = _year_of(data.get("Year"))
+            yok = not year or (ry.isdigit() and abs(int(ry) - int(year)) <= 1)
+            if yok and _sim(full, data.get("Title", "")) >= 0.85:
+                return data
+        if "y" not in params:
+            break
+        params.pop("y")
+
     for c in cands:
         sp = {"apikey": key, "s": c}
         if typ == "series":
@@ -352,12 +361,19 @@ def _lookup(title, year, typ, key):
     return dict(NOT_FOUND)
 
 
+LIMITED = []  # non-empty once OMDb says 401 (daily quota spent, or a bad key)
+
+
 def _get(params):
+    if LIMITED:  # every further call would 401 too: finish the run from cache alone
+        return {"Response": "False", "Error": LIMITED[0], "transient": True}
     url = "https://www.omdbapi.com/?" + urllib.parse.urlencode(params)
     try:
         with urllib.request.urlopen(url, timeout=15) as r:
             return json.load(r)
     except Exception as e:  # network/auth error -> a miss for this run, never cached
+        if getattr(e, "code", None) == 401:
+            LIMITED.append(json.loads(e.read() or "{}").get("Error") or str(e))
         return {"Response": "False", "Error": str(e), "transient": True}
 
 
@@ -1150,27 +1166,37 @@ def main():
         print(f"  [info] retrying {old} miss(es) recorded before the current search")
 
     entries = []
-    for raw, title, year, typ, source, watched, base, mtime in scan():
-        corr = corrections.get(raw, {})
-        if corr.get("ignore"):
-            continue
-        title = corr.get("title") or title
-        year = corr.get("year") or year
-        imdb_id = corr.get("imdb_id")
-        data = omdb(title, year, typ, key, cache, args.refresh, imdb_id=imdb_id)
-        ok = data.get("Response") == "True"
-        tag = " OK " if ok else ("ERR " if data.get("transient") else "MISS")
-        print(
-            f"  [{tag}] {title} [{typ}] [{source}]{' [watched]' if watched else ''}"
-            + (f" -- {data.get('Error')}" if data.get("transient") else "")
-        )
-        entries.append(
-            build_entry(
-                raw, title, year, typ, data, source, watched, base, added=mtime
+    try:  # quota is spent per lookup: keep what this run paid for, even on Ctrl-C
+        for raw, title, year, typ, source, watched, base, mtime in scan():
+            corr = corrections.get(raw, {})
+            if corr.get("ignore"):
+                continue
+            title = corr.get("title") or title
+            year = corr.get("year") or year
+            imdb_id = corr.get("imdb_id")
+            data = omdb(title, year, typ, key, cache, args.refresh, imdb_id=imdb_id)
+            ok = data.get("Response") == "True"
+            tag = " OK " if ok else ("ERR " if data.get("transient") else "MISS")
+            print(
+                f"  [{tag}] {title} [{typ}] [{source}]{' [watched]' if watched else ''}"
+                + (f" -- {data.get('Error')}" if data.get("transient") else "")
             )
+            entries.append(
+                build_entry(
+                    raw, title, year, typ, data, source, watched, base, added=mtime
+                )
+            )
+    finally:
+        CACHE.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8"
         )
-    CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
     entries = merge_duplicates(entries)
+    if LIMITED:
+        pending = sum(not e["matched"] for e in entries)
+        print(
+            f"\n  [info] OMDb: {LIMITED[0]} Progress is saved in {CACHE.name}; re-run"
+            f" later to look up the rest (up to {pending} unmatched)."
+        )
 
     if args.rename:
         rename_entries(entries, corrections, force=not args.dry_run)
@@ -1178,6 +1204,9 @@ def main():
         return
     # A plain run never touches files: renaming is opt-in via --rename.
     CORRECTIONS_FILE.write_text(json.dumps(corrections, ensure_ascii=False, indent=2))
+    if LIMITED:  # a half-looked-up page would replace a good one; keep the old page
+        print(f"  [info] {OUT.name} left as it was.")
+        return
 
     generate(entries, corrections)
     matched = sum(e["matched"] for e in entries)
