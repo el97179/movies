@@ -24,6 +24,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -31,7 +32,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 VIDEOS = Path.home() / "Videos"
-SARONIC_IP = os.environ.get("SARONIC_IP")
+SARONIC_IP = os.environ.get("SARONIC_IP", "saronic")  # ~/.ssh/config alias
 HERE = Path(__file__).parent
 CACHE = HERE / "cache.json"
 CORRECTIONS_FILE = HERE / "corrections.json"
@@ -190,9 +191,26 @@ def _entry(name, is_dir, source, watched, base):
     return (name, title, year, typ, source, watched, base) if title else None
 
 
+def parse_remote_listing(out):
+    """Parse `ls -1p` output, optionally followed by a ::STAT:: section of
+    `mtime|name` lines. Returns [(name, is_dir, mtime_or_None)]."""
+    names, mtimes, in_stat = [], {}, False
+    for line in out.splitlines():
+        if line == "::STAT::":
+            in_stat = True
+        elif in_stat:
+            parts = line.split("|", 1)
+            if len(parts) == 2 and parts[0].isascii() and parts[0].isdigit():
+                mtimes[parts[1]] = int(parts[0])
+        elif line.strip():
+            names.append((line.rstrip("/"), line.endswith("/")))
+    return [(n, d, mtimes.get(n)) for n, d in names]
+
+
 def remote_listing(path="~/Videos"):
-    """Yield (name, is_dir) for a remote path over SSH. # ponytail: `ls -1p`,
-    the trailing '/' marks dirs; swap to `find` only if subfolders need walking."""
+    """Yield (name, is_dir, mtime) for a remote path over SSH; mtime is epoch
+    seconds or None. # ponytail: `ls -1p`, the trailing '/' marks dirs; swap to
+    `find` only if subfolders need walking."""
     if not SARONIC_IP:
         print("  [WARN] SARONIC_IP not set, skipping Saronic", file=sys.stderr)
         return
@@ -205,7 +223,7 @@ def remote_listing(path="~/Videos"):
                 "-o",
                 "ConnectTimeout=10",
                 SARONIC_IP,
-                f"ls -1p {path}",
+                f"ls -1p {path} && (echo ::STAT::; cd {path} && stat -c '%Y|%n' -- * 2>/dev/null; true)",
             ],
             capture_output=True,
             text=True,
@@ -222,10 +240,7 @@ def remote_listing(path="~/Videos"):
             file=sys.stderr,
         )
         return
-    out = r.stdout
-    for line in out.splitlines():
-        if line.strip():
-            yield line.rstrip("/"), line.endswith("/")
+    yield from parse_remote_listing(r.stdout)
 
 
 REMOTE_DIRS = [
@@ -238,20 +253,29 @@ REMOTE_DIRS = [
 ]
 
 
+def _local_mtime(child):
+    """Epoch seconds, or None if the entry can't be stat'ed (dangling symlink)."""
+    try:
+        return int(child.stat().st_mtime)
+    except OSError:
+        return None
+
+
 def scan():
-    """Yield (raw, title, year, type, source, watched, base_dir) per library entry."""
+    """Yield (raw, title, year, type, source, watched, base_dir, mtime) per library
+    entry; mtime is epoch seconds, or None when a remote stat is unavailable."""
     for base, watched in ((VIDEOS, False), (VIDEOS / "_watched", True)):
         if not base.is_dir():
             continue
         for child in sorted(base.iterdir()):
             e = _entry(child.name, child.is_dir(), "Local", watched, str(base))
             if e:
-                yield e
+                yield e + (_local_mtime(child),)
     for path, source, watched in REMOTE_DIRS:
-        for name, is_dir in remote_listing(path):
+        for name, is_dir, mtime in remote_listing(path):
             e = _entry(name, is_dir, source, watched, path)
             if e:
-                yield e
+                yield e + (mtime,)
 
 
 # Bump when the lookup logic gets smarter: negatives cached by an older, dumber search
@@ -344,7 +368,17 @@ def rt_rating(data):
     return ""
 
 
-def build_entry(raw, title, year, typ, data, source="Local", watched=False, base=""):
+def build_entry(
+    raw,
+    title,
+    year,
+    typ,
+    data,
+    source="Local",
+    watched=False,
+    base="",
+    added=None,
+):
     matched = data.get("Response") == "True"
     disp_title = data.get("Title") if matched else title
     disp_year = (data.get("Year") if matched else year) or ""
@@ -376,6 +410,7 @@ def build_entry(raw, title, year, typ, data, source="Local", watched=False, base
         "sources": [source],
         "paths": [[source, base, raw]],  # one per physical copy, for --rename
         "watched": watched,
+        "added": added,  # epoch seconds (folder mtime) or None
     }
 
 
@@ -396,6 +431,8 @@ def merge_duplicates(entries):
                     m["paths"].append(p)
             if e["watched"]:
                 m["watched"] = True
+            known = [a for a in (m["added"], e["added"]) if a is not None]
+            m["added"] = min(known) if known else None
     return [seen[k] for k in order]
 
 
@@ -467,6 +504,11 @@ HTML = """<!doctype html>
   details.plot summary::before{content:'▶ Plot'}
   details[open].plot summary::before{content:'▼ Plot'}
   details.plot p{margin:6px 0 0;line-height:1.5}
+  #genres{position:relative}
+  #genres summary{cursor:pointer;font-size:13px}
+  #genreList{position:absolute;top:100%;left:0;z-index:10;background:#1d2027;border:1px solid #2c303a;
+    border-radius:8px;padding:8px 12px;display:grid;grid-template-columns:repeat(2,max-content);
+    gap:6px 16px;max-height:60vh;overflow:auto}
 </style></head><body>
 <header>
   <h1>🎬 My Video Library</h1>
@@ -480,9 +522,12 @@ HTML = """<!doctype html>
   <div class="sep"></div>
   <label class="cb"><input type="checkbox" id="cWatched"> Watched</label>
   <div class="sep"></div>
+  <details id="genres"><summary>Genres</summary><div id="genreList"></div></details>
+  <div class="sep"></div>
   <select id="sort">
     <option value="title">Name</option><option value="year">Year</option>
     <option value="imdb">IMDb rating</option><option value="rt">RT rating</option>
+    <option value="added">Recently added</option>
   </select>
   <button id="dir" title="Toggle direction">▲ Asc</button>
   <div class="sep"></div>
@@ -581,14 +626,24 @@ function openZoom(m){
 }
 zoom.addEventListener('click',e=>{if(e.target===zoom)zoom.close();});  // backdrop click
 let asc=true;
+const genreList=document.getElementById('genreList'), genreSum=document.querySelector('#genres summary');
+const gtok=m=>(m.genre||'').split(',').map(t=>t.trim()).filter(t=>t&&t!=='N/A');
+[...new Set(DATA.flatMap(gtok))].sort().forEach(t=>{
+  const l=document.createElement('label');l.className='cb';
+  l.innerHTML='<input type="checkbox" value="'+esc(t)+'"> '+esc(t);
+  genreList.appendChild(l);
+});
 const num=v=>{const n=parseFloat(v);return isNaN(n)?-1:n};
 function render(){
   const term=q.value.toLowerCase(), key=sortSel.value;
   const srcs=new Set([cLocal.checked&&'Local',cSaronic.checked&&'Saronic',cWD.checked&&'WD'].filter(Boolean));
+  const gsel=new Set([...genreList.querySelectorAll('input:checked')].map(i=>i.value));
+  genreSum.textContent=gsel.size?'Genres ('+gsel.size+')':'Genres';
   let rows=DATA.filter(m=>(m.title+' '+m.director+' '+m.actors).toLowerCase().includes(term)
     &&(m.type==='series'?cSeries.checked:cMovies.checked)
     &&m.sources.some(s=>srcs.has(s))
-    &&m.watched===cWatched.checked);
+    &&m.watched===cWatched.checked
+    &&(!gsel.size||gtok(m).some(t=>gsel.has(t))));
   rows.sort((a,b)=>{
     let x,y;
     if(key==='title'){x=a.title.toLowerCase();y=b.title.toLowerCase();return x<y?-1:x>y?1:0;}
@@ -651,7 +706,11 @@ function card(m,i){
 }
 dirBtn.onclick=()=>{asc=!asc;dirBtn.textContent=asc?'▲ Asc':'▼ Desc';render();};
 q.addEventListener('input',render);
-sortSel.addEventListener('input',render);
+sortSel.addEventListener('input',()=>{
+  if(sortSel.value==='added'){asc=false;dirBtn.textContent='▼ Desc';}
+  render();
+});
+genreList.addEventListener('change',render);
 [cMovies,cSeries,cLocal,cSaronic,cWD,cWatched].forEach(el=>el.addEventListener('change',render));
 _save();
 render();
@@ -1016,6 +1075,41 @@ def selftest():
         ("Mulholland-Dr._(1999).mkv", ("Mulholland Dr.", "1999", "movie")),
     ]:
         assert parse_name(n) == want, (n, parse_name(n))
+    # remote listing: names + optional mtimes, failing soft to None
+    assert parse_remote_listing("a/\nb.mkv\n::STAT::\n100|a\n200|b.mkv\n") == [
+        ("a", True, 100),
+        ("b.mkv", False, 200),
+    ]
+    assert parse_remote_listing("a/\n") == [("a", True, None)]
+    assert parse_remote_listing("a/\n::STAT::\nnot-a-line\nx|a\n") == [
+        ("a", True, None)
+    ]
+    assert parse_remote_listing("x|y/\n::STAT::\n5|x|y\n") == [("x|y", True, 5)]
+
+    assert parse_remote_listing("a/\n::STAT::\n²|a\n") == [("a", True, None)]
+
+    # a dangling symlink must give mtime None, not crash the scan
+    with tempfile.TemporaryDirectory() as td:
+        link = Path(td) / "dangling"
+        link.symlink_to(Path(td) / "missing")
+        assert _local_mtime(link) is None
+        assert isinstance(_local_mtime(Path(td)), int)
+
+    # added: carried by build_entry, oldest non-null wins when merging copies
+    miss = {"Response": "False"}
+    assert build_entry("r", "T", "2000", "movie", miss)["added"] is None
+    assert build_entry("r", "T", "2000", "movie", miss, added=123)["added"] == 123
+
+    def _merged(a, b):
+        es = [
+            build_entry("r", "T", "2000", "movie", miss, added=x) for x in (a, b)
+        ]
+        return merge_duplicates(es)[0]["added"]
+
+    assert _merged(300, 100) == 100
+    assert _merged(None, 100) == 100
+    assert _merged(100, None) == 100
+    assert _merged(None, None) is None
     print(f"selftest: {len(cases)} cases passed")
 
 
@@ -1056,7 +1150,7 @@ def main():
         print(f"  [info] retrying {old} miss(es) recorded before the current search")
 
     entries = []
-    for raw, title, year, typ, source, watched, base in scan():
+    for raw, title, year, typ, source, watched, base, mtime in scan():
         corr = corrections.get(raw, {})
         if corr.get("ignore"):
             continue
@@ -1070,7 +1164,11 @@ def main():
             f"  [{tag}] {title} [{typ}] [{source}]{' [watched]' if watched else ''}"
             + (f" -- {data.get('Error')}" if data.get("transient") else "")
         )
-        entries.append(build_entry(raw, title, year, typ, data, source, watched, base))
+        entries.append(
+            build_entry(
+                raw, title, year, typ, data, source, watched, base, added=mtime
+            )
+        )
     CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
     entries = merge_duplicates(entries)
 
