@@ -6,12 +6,15 @@ Usage:
   python3 build.py               # scan + fetch (cached) + write movies.html
   python3 build.py --refresh     # ignore cache, re-hit OMDb (costs ~1 call per title)
   python3 build.py --selftest    # run parser self-checks, no network
-  python3 build.py --no-rename   # don't rename files whose fix was just picked up
+  python3 build.py --rename --dry-run  # show what --rename would change
+  python3 build.py --rename      # rename files/folders to <Title>_(<year>), no page
+
+A plain run never renames or moves video files.
 
 Fixing a wrong or missing match:
   open movies.html, hit the pencil on any card, fill in a title/year or paste an IMDb
-  URL, then "Download fixes". The next run picks the file up from ~/Downloads, applies
-  it, and renames those files to the canonical name (logged to renames.log).
+  URL, then "Download fixes". The next run picks the file up from ~/Downloads and
+  applies it; --rename then renames to the canonical name (logged to renames.log).
 """
 
 import argparse
@@ -810,7 +813,7 @@ def rename_entries(entries, corrections, force=False):
 
     if not force:
         print(
-            f"\n{len(planned)} rename(s) planned. Re-run with --rename --force to apply."
+            f"\n{len(planned)} rename(s) planned. Re-run without --dry-run to apply."
         )
         return planned
 
@@ -1025,13 +1028,10 @@ def main():
     ap.add_argument(
         "--rename",
         action="store_true",
-        help="rename to <Title>_(<year>) pattern (dry run by default)",
+        help="rename files/folders to the <Title>_(<year>) pattern",
     )
-    ap.add_argument("--force", action="store_true", help="with --rename: apply changes")
     ap.add_argument(
-        "--no-rename",
-        action="store_true",
-        help="don't auto-rename files whose fix was just picked up",
+        "--dry-run", action="store_true", help="with --rename: only show the plan"
     )
     args = ap.parse_args()
     if args.selftest:
@@ -1047,7 +1047,7 @@ def main():
         sys.exit(f"No such folder: {VIDEOS}")
 
     corrections = load_corrections()
-    fixed_now = pickup_corrections(corrections)
+    pickup_corrections(corrections)
     cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
     stale, old = purge_cache(cache)
     if stale:
@@ -1075,25 +1075,10 @@ def main():
     entries = merge_duplicates(entries)
 
     if args.rename:
-        rename_entries(entries, corrections, force=args.force)
+        rename_entries(entries, corrections, force=not args.dry_run)
         CORRECTIONS_FILE.write_text(json.dumps(corrections, ensure_ascii=False, indent=2))
         return
-    # Only the fixes that arrived in this run's pickup get renamed. Anything broader
-    # would sweep the whole back catalogue of hand-edited corrections into an
-    # irreversible mass rename across Local, Saronic and WD the first time it ran.
-    just_fixed = [
-        e
-        for e in entries
-        if e["matched"] and any(p[2] in fixed_now for p in e["paths"])
-    ]
-    if just_fixed and not args.no_rename:
-        print(f"\nRenaming {len(just_fixed)} just-fixed title(s):")
-        done = rename_entries(just_fixed, corrections, force=True)
-        moved = {old_raw: new_name for _, _, _, old_raw, new_name in done}
-        for e in just_fixed:  # so the page reports the names now on disk
-            for p in e["paths"]:
-                p[2] = moved.get(p[2], p[2])
-            e["raw"] = moved.get(e["raw"], e["raw"])
+    # A plain run never touches files: renaming is opt-in via --rename.
     CORRECTIONS_FILE.write_text(json.dumps(corrections, ensure_ascii=False, indent=2))
 
     generate(entries, corrections)
