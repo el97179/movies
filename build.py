@@ -33,7 +33,7 @@ from pathlib import Path
 
 VIDEOS = Path.home() / "Videos"
 SARONIC_IP = os.environ.get("SARONIC_IP", "saronic")  # ~/.ssh/config alias
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent  # through the ~/.local/bin symlink
 CACHE = HERE / "cache.json"
 CORRECTIONS_FILE = HERE / "corrections.json"
 # ponytail: the browser's default download dir; add a flag if it's ever not this.
@@ -178,7 +178,7 @@ def pick(results, full, candidate, year, typ):
 
 
 def _entry(name, is_dir, source, watched, base):
-    """Return (raw, title, year, type, source, watched, base) or None if skipped."""
+    """Return (raw, title, year, type, source, watched, base, is_dir) or None if skipped."""
     if name.startswith(".") or name == "_watched":
         return None
     if not is_dir and Path(name).suffix.lower() not in VIDEO_EXT:
@@ -188,7 +188,7 @@ def _entry(name, is_dir, source, watched, base):
         "/series" in base
     ):  # a folder under .../series/ is a series, whatever the name says
         typ = "series"
-    return (name, title, year, typ, source, watched, base) if title else None
+    return (name, title, year, typ, source, watched, base, is_dir) if title else None
 
 
 def parse_remote_listing(out):
@@ -262,7 +262,7 @@ def _local_mtime(child):
 
 
 def scan():
-    """Yield (raw, title, year, type, source, watched, base_dir, mtime) per library
+    """Yield (raw, title, year, type, source, watched, base_dir, is_dir, mtime) per library
     entry; mtime is epoch seconds, or None when a remote stat is unavailable."""
     for base, watched in ((VIDEOS, False), (VIDEOS / "_watched", True)):
         if not base.is_dir():
@@ -394,10 +394,15 @@ def build_entry(
     watched=False,
     base="",
     added=None,
+    is_dir=False,
 ):
     matched = data.get("Response") == "True"
     disp_title = data.get("Title") if matched else title
     disp_year = (data.get("Year") if matched else year) or ""
+    # OMDb's Year is often the US release ("Take the Money and Run" 1969 -> 1970). Once
+    # matched, a nearby year in the name is the original release: keep it.
+    if matched and year and disp_year.isdigit() and abs(int(disp_year) - int(year)) <= 2:
+        disp_year = year
     q = urllib.parse.quote_plus(f"{disp_title} {disp_year} trailer".strip())
     poster = data.get("Poster", "")
     span = re.sub(r"[–—]", "-", disp_year)  # OMDb uses an en dash: "2008–2011"
@@ -424,7 +429,7 @@ def build_entry(
         "matched": matched,
         "raw": raw,
         "sources": [source],
-        "paths": [[source, base, raw]],  # one per physical copy, for --rename
+        "paths": [[source, base, raw, is_dir]],  # one per physical copy, for --rename
         "watched": watched,
         "added": added,  # epoch seconds (folder mtime) or None
     }
@@ -841,8 +846,9 @@ def rename_entries(entries, corrections, force=False):
             else (f"{title}_(series)" if e["type"] == "series" else title)
         )
 
-        for source, base, raw in e["paths"]:
-            ext = Path(raw).suffix
+        for source, base, raw, is_dir in e["paths"]:
+            # a folder named "X.mkv" has no extension to keep
+            ext = "" if is_dir else Path(raw).suffix
             new_name = stem + (
                 ext if ext.lower() in VIDEO_EXT else ""
             )  # keep file extension
@@ -892,12 +898,12 @@ def rename_entries(entries, corrections, force=False):
         )
         return planned
 
-    renamed = set()
+    renamed, done = set(), 0
     for kind, old, new, old_raw, new_name in planned:
-        if kind == "local":
-            old.rename(new)
-        else:
-            try:
+        try:
+            if kind == "local":
+                old.rename(new)
+            else:
                 assert SARONIC_IP
                 subprocess.run(
                     [
@@ -913,21 +919,25 @@ def rename_entries(entries, corrections, force=False):
                     timeout=30,
                     capture_output=True,
                 )
-            except (subprocess.SubprocessError, OSError) as exc:
-                print(f"  [ERR] {old} -> {new}: {exc}", file=sys.stderr)
-                continue
+        except (subprocess.SubprocessError, OSError) as exc:
+            print(f"  [ERR] {old} -> {new}: {exc}", file=sys.stderr)
+            continue
+        done += 1
+        # Saved per rename, not at the end: a run cut short (Ctrl-C, dropped ssh) has
+        # already moved files, and a stale log/corrections would orphan them.
+        # The log is an undo trail: a mistyped IMDb id renames real files, and the old
+        # name is the only way back. Append-only, never read by the program.
+        with (HERE / "renames.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%F %T}\t{kind}\t{old}\t{new}\n")
         if old_raw not in renamed:
             renamed.add(old_raw)
             if old_raw in corrections:  # keep the fix pointing at the new filename
                 corrections[new_name] = corrections.pop(old_raw)
+                CORRECTIONS_FILE.write_text(
+                    json.dumps(corrections, ensure_ascii=False, indent=2)
+                )
 
-    # An undo trail: a mistyped IMDb id renames real files, and the old name is the
-    # only way back. Append-only, never read by the program.
-    if renamed:
-        with (HERE / "renames.log").open("a", encoding="utf-8") as fh:
-            for kind, old, new, _, _ in planned:
-                fh.write(f"{datetime.now():%F %T}\t{kind}\t{old}\t{new}\n")
-    print(f"\n{len(planned)} rename(s) applied, logged to {HERE / 'renames.log'}.")
+    print(f"\n{done} of {len(planned)} rename(s) applied, logged to {HERE / 'renames.log'}.")
     return planned
 
 
@@ -1036,7 +1046,7 @@ def selftest():
         False,
         "~/Videos/movies",
     )
-    e["paths"].append(["WD", "/volumeUSB1/usbshare/Videos", "The Holiday (2006)"])
+    e["paths"].append(["WD", "/volumeUSB1/usbshare/Videos", "The Holiday (2006)", True])
     plan = [(old, new) for _, old, new, _, _ in rename_entries([e], {}, force=False)]
     assert plan == [
         (
@@ -1048,6 +1058,10 @@ def selftest():
             "/volumeUSB1/usbshare/Videos/The-Holiday_(2006)",
         ),
     ], plan
+    # ...and a folder that happens to be named "X.mkv" drops the fake extension
+    e["paths"] = [["WD", "/v", "The.Holiday.2006.mkv", True]]
+    plan = [new for _, _, _, _, new in rename_entries([e], {}, force=False)]
+    assert plan == ["The-Holiday_(2006)"], plan
 
     # finished series -> full run; still-airing -> first year; no year -> (series)
     def _series(raw, title, year, matched=True):
@@ -1111,6 +1125,15 @@ def selftest():
         assert _local_mtime(link) is None
         assert isinstance(_local_mtime(Path(td)), int)
 
+    # year: the name's original-release year beats OMDb's drifted US one, within 2
+    def _y(name_year, omdb_year):
+        return build_entry("r", "T", name_year, "movie",
+                           {"Response": "True", "Year": omdb_year})["year"]
+    assert _y("1969", "1970") == "1969"
+    assert _y("1994", "1996") == "1994"
+    assert _y("1990", "2005") == "2005"  # far off: the name is wrong, not OMDb
+    assert _y(None, "1970") == "1970"
+
     # added: carried by build_entry, oldest non-null wins when merging copies
     miss = {"Response": "False"}
     assert build_entry("r", "T", "2000", "movie", miss)["added"] is None
@@ -1126,6 +1149,22 @@ def selftest():
     assert _merged(None, 100) == 100
     assert _merged(100, None) == 100
     assert _merged(None, None) is None
+
+    # a real rename saves the moved correction and the log as it goes, not at the end
+    global HERE, CORRECTIONS_FILE
+    saved = HERE, CORRECTIONS_FILE
+    with tempfile.TemporaryDirectory() as td:
+        HERE, CORRECTIONS_FILE = Path(td), Path(td) / "corrections.json"
+        (Path(td) / "Trolosa").mkdir()
+        hit = {"Response": "True", "Title": "Faithless", "Year": "2000"}
+        corr = {"Trolosa": {"imdb_id": "tt0157122"}}
+        rename_entries([build_entry("Trolosa", "Trolosa", None, "movie", hit,
+                                    base=td)], corr, force=True)
+        assert (Path(td) / "Faithless_(2000)").is_dir()
+        assert json.loads(CORRECTIONS_FILE.read_text()) == {
+            "Faithless_(2000)": {"imdb_id": "tt0157122"}}
+        assert "Faithless_(2000)" in (Path(td) / "renames.log").read_text()
+    HERE, CORRECTIONS_FILE = saved
     print(f"selftest: {len(cases)} cases passed")
 
 
@@ -1167,7 +1206,7 @@ def main():
 
     entries = []
     try:  # quota is spent per lookup: keep what this run paid for, even on Ctrl-C
-        for raw, title, year, typ, source, watched, base, mtime in scan():
+        for raw, title, year, typ, source, watched, base, is_dir, mtime in scan():
             corr = corrections.get(raw, {})
             if corr.get("ignore"):
                 continue
@@ -1183,7 +1222,8 @@ def main():
             )
             entries.append(
                 build_entry(
-                    raw, title, year, typ, data, source, watched, base, added=mtime
+                    raw, title, year, typ, data, source, watched, base, added=mtime,
+                    is_dir=is_dir,
                 )
             )
     finally:

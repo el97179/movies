@@ -1,0 +1,38 @@
+imdb_id	title	path
+tt35513027	Sundays (2025)	/home/tanman/Videos/Los-Domingos_(2025)
+tt0064116	Once Upon a Time in the West (1968)	~/Videos/movies/233---ONCE-UPON-A-TIME-IN-THE-WEST-(1968)-+-MY-DARLING-CLEMENTINE-(1946)-ft.-Eddie-Averill_(1968)
+tt0051378	Elevator to the Gallows (1958)	~/Videos/movies/Ascenseur-pour-l'echafaud_(1958)
+tt0146458	Valkanizater (1997)	~/Videos/movies/Balkanizater_(1997)
+tt0104779	Bitter Moon (1992)	~/Videos/movies/Bitter-Moon_(1992)
+tt0109348	Bullets Over Broadway (1994)	~/Videos/movies/BulletsOverBroadway
+tt5078204	Two Is a Family (2016)	~/Videos/movies/Demain-Tout-Commence
+tt7250056	Non-Fiction (2018)	~/Videos/movies/Doubles-Vies_(2018)
+tt0068348	The Castle of Purity (1973)	~/Videos/movies/El-Castillo-de-la-Pureza
+tt0347048	Head-On (2004)	~/Videos/movies/Gegen-die-Wand-Making-of_(2004)
+tt0110148	Interview with the Vampire (1994)	~/Videos/movies/Interview-with-the-Vampire_(1994)
+tt2278871	Blue Is the Warmest Colour (2013)	~/Videos/movies/La-vie-d'-Adele
+tt0398883	The Consequences of Love (2004)	~/Videos/movies/Le-Consequenze-dell'-Amore
+tt1646974	The Names of Love (2010)	~/Videos/movies/Le-Nom-Des-Gens
+tt0065531	The Red Circle (1970)	~/Videos/movies/Le-cercle-rouge_(1970)
+tt0286244	The Triplets of Belleville (2003)	~/Videos/movies/Les-Triplettes-de-Belleville
+tt0120882	The Visitors II: The Corridors of Time (1998)	~/Videos/movies/Les-visiteurs-Collection_(1993)
+tt0844457	North Face (2008)	~/Videos/movies/Nordwand-[North-Face]_(2008)
+tt4901306	Perfect Strangers (2016)	~/Videos/movies/Perfetti-Sconosciuti_(2016)
+tt0073540	Picnic at Hanging Rock (1975)	~/Videos/movies/Picnic-at-Hanging-Rock_(1979)
+tt0047478	Seven Samurai (1954)	~/Videos/movies/Seven-Samurai_(1954)
+tt0177242	Sun Alley (1999)	~/Videos/movies/Sonnenallee
+tt0057565	High and Low (1963)	~/Videos/movies/Tengoku-to-jigoku-A-Kurosawa-!!
+tt1131729	Pirate Radio / The Boat That Rocked (2009)	~/Videos/movies/The-Boat-That-Rocked_(2009)
+tt1568346	The Girl with the Dragon Tattoo (2011, Fincher)	~/Videos/movies/The-Girl-With-A-Dragon-Tattoo
+tt0057611	The Silence (1963)	~/Videos/movies/The-Silence-Ing-Bergman-!
+tt0157122	Faithless (2000)	~/Videos/movies/Trolosa
+tt5791098	Tel Aviv on Fire (2018)	~/Videos/movies/Tutti-pazzi-a-tel-aviv-Tel-aviv-on-fire_(2019)
+tt0114787	Underground (1995)	~/Videos/movies/Underground_(1995)
+tt0050986	Wild Strawberries (1957)	~/Videos/movies/Wild-Strawberries_(1957)
+tt35657504	La cena / The Dinner (2025)	~/Videos/movies/www.UIndex.org    -    The Dinner (2025) 1080p BluRay 5.1-WORLD
+tt0040522	Bicycle Thieves (1948)	~/Videos/movies/Κλεφτης-ποδηλατων
+tt3129564	Diplomacy (2014)	~/Videos/movies/ΝΥΧΤΑ-ΠΡΙΝ-ΠΕΣΕΙ-ΤΟ-ΠΑΡΙΣΙ-Diplomacy
+tt2331143	Like Father, Like Son (2013)	~/Videos/movies/ΠΑΤΕΡΑΣ-ΚΑΙ-ΓΙΟΣ-JAPAN_(2013)
+tt1708523	The Island (2010-2011, series)	~/Videos/series/To-Nisi_(series_2010)
+tt27751957	The 47 (2024)	~/Videos/movies/_watched/El-47_(2024)
+tt34886821	La Grazia (2025)	~/Videos/movies/_watched/Grace_(2025)
