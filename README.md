@@ -16,7 +16,14 @@ python3 build.py --refresh     # ignore cache, re-hit OMDb (~1 call per title)
 python3 build.py --selftest    # run parser self-checks, no network
 python3 build.py --rename --dry-run  # show what --rename would change
 python3 build.py --rename      # rename files/folders to <Title>_(<year>), no page
+python3 build.py --install-handler  # once: make the page's ▶ Play buttons open VLC
 ```
+
+▶ Play links use a `movies-play://` scheme that `--install-handler` registers
+(`~/.local/share/applications/movies-play.desktop`, run as `movies-db --play`).
+NAS copies play from the SMB share through GNOME's gvfs mount, mounted on demand
+with the login saved in the keyring: open `smb://saronic.local/` in Files once
+and save the password. Override the host with `SARONIC_SMB`.
 
 A plain run never renames or moves video files; only `--rename` does (logged
 to `renames.log`). Check `--rename --dry-run` first: the sweep covers every

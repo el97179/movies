@@ -25,6 +25,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import unicodedata
 import urllib.request
@@ -459,6 +460,12 @@ def _probe_remote(paths, done):
                 done(rel[f], out)
 
 
+def main_video(files):
+    """The (relpath, size, mtime) of an entry's largest video -- the feature, not a sample."""
+    vids = [f for f in files if Path(f[0]).suffix.lower() in VIDEO_EXT]
+    return max(vids, key=lambda f: f[1]) if vids else None
+
+
 def subtitles(rows):
     """rows: (source, base, raw, is_dir, files, data). Returns per row None (no subtitles)
     or the sorted languages found, [] when there are subtitles of unknown language.
@@ -469,10 +476,9 @@ def subtitles(rows):
     packs turn out mixed."""
     mains, todo = [], {"Local": {}, "remote": {}}
     for source, base, raw, is_dir, files, data in rows:
-        vids = [f for f in files if Path(f[0]).suffix.lower() in VIDEO_EXT]
-        main = None
-        if vids:
-            rel, size, mtime = max(vids, key=lambda f: f[1])
+        mv, main = main_video(files), None
+        if mv:
+            rel, size, mtime = mv
             path = f"{base}/{rel}"
             known = data.setdefault("Subs", {})
             k = f"{source}|{path}"
@@ -683,6 +689,7 @@ def build_entry(
     added=None,
     is_dir=False,
     subs=None,
+    main=None,
 ):
     matched = data.get("Response") == "True"
     disp_title = data.get("Title") if matched else title
@@ -695,6 +702,7 @@ def build_entry(
     poster = data.get("Poster", "")
     span = re.sub(r"[–—]", "-", disp_year)  # OMDb uses an en dash: "2008–2011"
     orig = data.get("OrigTitle", "") if matched else ""
+    typ = (data.get("Type") if matched else typ) or typ
     return {
         "title": disp_title,
         # original-language title (Wikidata), only when it isn't just the displayed one
@@ -703,7 +711,7 @@ def build_entry(
         or "",  # "2024–" -> "2024", for sort/merge
         # a series' run: "2008-2013" finished, "2008-" still airing. "" for movies.
         "years": span if "-" in span else "",
-        "type": (data.get("Type") if matched else typ) or typ,
+        "type": typ,
         "director": data.get("Director", "") if matched else "",
         "actors": data.get("Actors", "") if matched else "",
         "genre": data.get("Genre", "") if matched else "",
@@ -724,6 +732,9 @@ def build_entry(
         "watched": watched,
         "added": added,  # epoch seconds (folder mtime) or None
         "subs": subs,  # None: no subtitles; else languages, [] if none are known
+        # what Play opens per copy: a movie folder's main video; a series folder whole
+        # (VLC queues its episodes); a bare video itself
+        "play": [[source, f"{base}/{main if is_dir and main and typ != 'series' else raw}"]],
     }
 
 
@@ -742,6 +753,7 @@ def merge_duplicates(entries):
             for p in e["paths"]:
                 if p not in m["paths"]:
                     m["paths"].append(p)
+            m["play"] += [p for p in e["play"] if p not in m["play"]]
             if e["watched"]:
                 m["watched"] = True
             known = [a for a in (m["added"], e["added"]) if a is not None]
@@ -798,6 +810,7 @@ HTML = """<!doctype html>
   .card.watched:hover{opacity:.85;filter:none}
   a.trailer{margin-top:auto;text-align:center;padding:8px;border-radius:8px;
     background:#b91c1c;color:#fff;text-decoration:none;font-size:13px}
+  a.trailer.play{background:#15803d}
   a.trailer:hover{background:#dc2626}
   .sep{width:1px;height:24px;background:#2c303a;align-self:center}
   label.cb{display:flex;align-items:center;gap:5px;font-size:13px;cursor:pointer;white-space:nowrap}
@@ -936,7 +949,8 @@ function openZoom(m){
       ${m.plot&&m.plot!=='N/A'?`<p style="line-height:1.5">${esc(m.plot)}</p>`:'<p class="meta">No plot available.</p>'}
       <div style="display:flex;gap:6px">
         ${m.imdb_url?`<a class="trailer" style="flex:0 0 auto;background:#f5c518;color:#000" href="${esc(m.imdb_url)}" target="_blank" rel="noopener">IMDb</a>`:''}
-        <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">▶ Trailer</a>
+        ${playBtn(m)}
+        <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">Trailer</a>
       </div>
     </div>`;
   zoomBody.querySelector('#zoomClose').onclick=()=>zoom.close();
@@ -974,6 +988,13 @@ function render(){
   count.textContent=rows.length+' titles';
   CURRENT_ROWS=rows;
   grid.innerHTML=rows.map((m,i)=>card(m,i)).join('');
+}
+// movies-play:// is handled by `movies-db --play` (see --install-handler), which opens VLC
+const PREF=['Local','Saronic','WD'];
+function playBtn(m){
+  const [src,path]=[...m.play].sort((a,b)=>PREF.indexOf(a[0])-PREF.indexOf(b[0]))[0];
+  const href='movies-play://play?src='+encodeURIComponent(src)+'&path='+encodeURIComponent(path);
+  return `<a class="trailer play" style="flex:1" href="${esc(href)}" title="Play in VLC (${esc(src)})">▶ Play</a>`;
 }
 function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function card(m,i){
@@ -1022,7 +1043,8 @@ function card(m,i){
       ${m.plot&&m.plot!=='N/A'?`<details class="plot"><summary></summary><p>${esc(m.plot)}</p></details>`:''}
       <div style="display:flex;gap:6px;margin-top:auto">
         ${m.imdb_url?`<a class="trailer" style="flex:0 0 auto;background:#f5c518;color:#000" href="${esc(m.imdb_url)}" target="_blank" rel="noopener">IMDb</a>`:''}
-        <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">▶ Trailer</a>
+        ${playBtn(m)}
+        <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">Trailer</a>
       </div>
     </div></div>`;
 }
@@ -1521,6 +1543,25 @@ def selftest():
     assert _msubs(None, []) == [] and _msubs(["en"], ["el"]) == ["el", "en"]
     assert _msubs(None, None) is None
 
+    # Play: a movie folder opens its main video, a series folder itself, a file itself
+    hit = {"Response": "True", "Title": "T", "Type": "movie"}
+    assert build_entry("D", "T", None, "movie", hit, "Saronic", base="~/V", is_dir=True,
+                       main="D/x/big.mkv")["play"] == [["Saronic", "~/V/D/x/big.mkv"]]
+    assert build_entry("S", "T", None, "series", miss, base="/b", is_dir=True,
+                       main="S/e1.mkv")["play"] == [["Local", "/b/S"]]
+    assert build_entry("D", "T", None, "movie", miss, base="/b", is_dir=True)["play"] == [
+        ["Local", "/b/D"]]  # empty folder: open it, VLC says what's (not) there
+    assert smb_path("~/Videos/movies/A/a.mkv") == ("home", "Videos/movies/A/a.mkv")
+    assert smb_path("/volumeUSB1/usbshare/Videos/b.mkv") == ("usbshare1", "Videos/b.mkv")
+    assert smb_path("/etc/passwd") is None
+    # links come from a web page: nothing outside the library gets through
+    assert play_target("Local", "/etc/passwd") is None
+    assert play_target("Local", str(VIDEOS / ".." / ".ssh" / "id_rsa")) is None
+    assert play_target("Saronic", "~/.ssh/id_rsa") is None
+    assert play_target("Saronic", "~/Videos/movies/../../.ssh/id_rsa") is None
+    assert play_target("WD", "~/Videos/movies/A/a.mkv") is None  # wrong source's base
+    assert play_target("Saronic", "-v") is None and play_target("Bogus", "/x") is None
+
     # original title: only in an original language, preferring one that isn't OMDb's
     zorba = [("Αλέξης Ζορμπάς", "el", "en"), ("Αλέξης Ζορμπάς", "el", "el"),
              ("Zorba the Greek", "en", "en"), ("Zorba the Greek", "en", "el")]
@@ -1555,6 +1596,94 @@ def selftest():
     print(f"selftest: {len(cases)} cases passed")
 
 
+SMB_HOST = os.environ.get("SARONIC_SMB", "saronic.local")
+# NAS path prefix -> the SMB share it's exported as (DSM names USB disks usbshareN)
+SMB_SHARES = {"~/": "home", "/volumeUSB1/usbshare/": "usbshare1"}
+HANDLER = Path.home() / ".local/share/applications/movies-play.desktop"
+
+
+def smb_path(path):
+    """NAS path -> (share, path inside it), or None outside the shares."""
+    for prefix, share in SMB_SHARES.items():
+        if path.startswith(prefix):
+            return share, path[len(prefix):]
+    return None
+
+
+def play_target(src, path):
+    """What VLC should open for a Play link: a local path, or the NAS file through its gvfs
+    SMB mount (mounted on demand with the keyring's saved login). None unless it's inside
+    the library: any web page can fire a movies-play:// link. No smb:// / sftp:// URL
+    fallback: VLC 3's smb input fails against DSM ("Invalid argument") and DSM's SFTP
+    service is off, so a missing mount is reported instead (see play)."""
+    if not path.startswith(("/", "~/")) or ".." in path.split("/"):
+        return None
+    if src == "Local":
+        p = Path(path)
+        return path if VIDEOS in p.parents and os.path.exists(p) else None
+    if not any(path.startswith(b + "/") for b, s, _ in REMOTE_DIRS if s == src):
+        return None
+    share, rest = smb_path(path) or (None, None)
+    if share is None:
+        return None
+    url = f"smb://{SMB_HOST}/{share}/"
+    mnt = Path(f"/run/user/{os.getuid()}/gvfs/smb-share:server={SMB_HOST},share={share}")
+    target = mnt / rest
+    for _ in range(12):  # gvfs can be mid-unmount, or ready a beat after `gio mount`
+        if os.path.exists(target):  # not Path.exists: a half-gone mount raises EIO
+            break
+        try:  # a no-op error when already mounted
+            subprocess.run(["gio", "mount", url], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=30)
+        except (subprocess.SubprocessError, OSError):
+            break
+        time.sleep(0.25)
+    return str(target)
+
+
+def _notify(msg):
+    print(msg, file=sys.stderr)
+    try:  # launched from the browser: stderr goes nowhere
+        subprocess.run(["notify-send", "Movies DB", msg], timeout=5)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def play(url):
+    """--play: the movies-play:// handler. Opens the copy in VLC, detached."""
+    u = urllib.parse.urlsplit(url)
+    q = urllib.parse.parse_qs(u.query)
+    src, path = (q.get(k, [""])[0] for k in ("src", "path"))
+    target = play_target(src, path) if u.scheme == "movies-play" else None
+    if not target:
+        _notify(f"Not a video in the library: {src} {path}")
+        sys.exit(1)
+    if not os.path.exists(target):
+        _notify(f"Can't reach {path} on {src}. If the NAS is up, open smb://{SMB_HOST}/ in"
+                " Files once and save the login, so it can be mounted on demand.")
+        sys.exit(1)
+    try:
+        subprocess.Popen(["vlc", target], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError as e:
+        _notify(f"Couldn't start VLC: {e}")
+        sys.exit(1)
+
+
+def install_handler():
+    """Register movies-play:// with the desktop so the page's Play buttons reach VLC."""
+    exe = Path(sys.argv[0]).absolute()  # the ~/.local/bin symlink when run as movies-db
+    HANDLER.parent.mkdir(parents=True, exist_ok=True)
+    HANDLER.write_text(
+        "[Desktop Entry]\nType=Application\nName=Movies DB player\nNoDisplay=true\n"
+        f'Exec="{exe}" --play %u\nMimeType=x-scheme-handler/movies-play;\n'
+    )
+    subprocess.run(["xdg-mime", "default", HANDLER.name, "x-scheme-handler/movies-play"],
+                   check=True)
+    print(f"movies-play:// -> {exe} --play ({HANDLER})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh", action="store_true", help="ignore cache")
@@ -1569,9 +1698,18 @@ def main():
     ap.add_argument(
         "--dry-run", action="store_true", help="with --rename: only show the plan"
     )
+    ap.add_argument("--play", metavar="URL", help="open a movies-play:// link in VLC")
+    ap.add_argument("--install-handler", action="store_true",
+                    help="register movies-play:// so the page's Play buttons work")
     args = ap.parse_args()
     if args.selftest:
         selftest()
+        return
+    if args.play:
+        play(args.play)
+        return
+    if args.install_handler:
+        install_handler()
         return
 
     key = os.environ.get("OMDB_API_KEY")
@@ -1612,13 +1750,13 @@ def main():
             )
         original_titles([p[4] for p in pending])
         subs = subtitles([(p[5], p[7], p[0], p[9], p[10], p[4]) for p in pending])
-        for (raw, title, year, typ, data, source, watched, base, mtime, is_dir, _), sub in zip(
+        for (raw, title, year, typ, data, source, watched, base, mtime, is_dir, files), sub in zip(
             pending, subs
         ):
             entries.append(
                 build_entry(
                     raw, title, year, typ, data, source, watched, base, added=mtime,
-                    is_dir=is_dir, subs=sub,
+                    is_dir=is_dir, subs=sub, main=(main_video(files) or [None])[0],
                 )
             )
     finally:
