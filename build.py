@@ -459,44 +459,49 @@ def _probe_remote(paths, done):
                 done(rel[f], out)
 
 
-def subtitles(rows, cache):
-    """rows: (source, base, raw, is_dir, files). Returns per row None (no subtitles) or the
-    sorted languages found, [] when there are subtitles of unknown language. Sidecars are
-    re-listed every run; embedded streams are probed once per file, cached in
-    cache["_subs"] by path|size|mtime. # ponytail: probes only the largest video, so one
-    episode stands in for a whole series; probe every episode if packs turn out mixed."""
-    known = cache.setdefault("_subs", {})
-    mains, todo = [], {"Local": [], "remote": []}
-    for source, base, raw, is_dir, files in rows:
+def subtitles(rows):
+    """rows: (source, base, raw, is_dir, files, data). Returns per row None (no subtitles)
+    or the sorted languages found, [] when there are subtitles of unknown language.
+    Sidecars are re-listed every run; embedded streams are probed once per file and kept
+    in the row's OMDb record (so in cache.json) as data["Subs"]["source|path"] =
+    {size, mtime, langs}; a changed size/mtime probes again. # ponytail: probes only the
+    largest video, so one episode stands in for a whole series; probe every episode if
+    packs turn out mixed."""
+    mains, todo = [], {"Local": {}, "remote": {}}
+    for source, base, raw, is_dir, files, data in rows:
         vids = [f for f in files if Path(f[0]).suffix.lower() in VIDEO_EXT]
-        path = key = None
+        main = None
         if vids:
             rel, size, mtime = max(vids, key=lambda f: f[1])
             path = f"{base}/{rel}"
-            key = f"{source}|{path}|{size}|{mtime}"
-            if key not in known:
-                todo["Local" if source == "Local" else "remote"].append((path, key))
-        mains.append(key)
+            known = data.setdefault("Subs", {})
+            k = f"{source}|{path}"
+            hit = known.get(k)
+            if not (hit and hit["size"] == size and hit["mtime"] == mtime):
+                todo["Local" if source == "Local" else "remote"][path] = (
+                    known, k, size, mtime)
+            main = (data["Subs"], k)
+        mains.append(main)
 
     for kind, items in todo.items():
         if not items:
             continue
-        keys = dict(items)
 
-        def done(path, out):
+        def done(path, out, items=items):
             langs = probe_langs(out)
             if langs is not None:  # opened and read: worth keeping
-                known[keys[path]] = langs
+                known, k, size, mtime = items[path]
+                known[k] = {"size": size, "mtime": mtime, "langs": langs}
 
-        (_probe_local if kind == "Local" else _probe_remote)(list(keys), done)
+        (_probe_local if kind == "Local" else _probe_remote)(list(items), done)
 
     out = []
-    for (source, base, raw, is_dir, files), key in zip(rows, mains):
+    for (source, base, raw, is_dir, files, data), main in zip(rows, mains):
         subs = [f[0] for f in files if Path(f[0]).suffix.lower() in SUB_EXT]
         stem = "" if is_dir else Path(raw).stem
         langs = {sidecar_lang(Path(f).name[len(stem):] if stem else Path(f).name)
                  for f in subs}
-        emb = known.get(key)
+        emb = (main[0].get(main[1]) or {}).get("langs") if main else None
         langs |= set(emb or [])
         langs -= {None, "und"}
         out.append(sorted(langs) if subs or emb else None)
@@ -522,7 +527,7 @@ def omdb(title, year, typ, key, cache, refresh, imdb_id=None):
     if data.get("Response") == "True":
         cache[ckey] = data
     elif not data.get("transient"):
-        cache[ckey] = dict(NOT_FOUND)
+        data = cache[ckey] = dict(NOT_FOUND)  # the cached dict: Subs land on it too
     return data
 
 
@@ -531,8 +536,7 @@ def purge_cache(cache):
     stale = [
         k
         for k, v in cache.items()
-        if k != "_subs"  # subtitle probes, not OMDb records
-        and v.get("Response") != "True" and v.get("Error") != NOT_FOUND["Error"]
+        if v.get("Response") != "True" and v.get("Error") != NOT_FOUND["Error"]
     ]
     old = [
         k
@@ -1491,19 +1495,24 @@ def selftest():
                             path, "broken"))
 
     globals()["_probe_local"] = _fake
-    c = {}
+    recs = [{"Response": "True"} for _ in range(4)]
     rows = [("Local", "/b", "A", True, [("A/a.mkv", 9, 1), ("A/s.mkv", 1, 1)]),
             ("Local", "/b", "B.mkv", False, [("B.mkv", 5, 1), ("B.Greek.srt", 1, 1)]),
             ("Local", "/b", "C.mkv", False, [("C.mkv", 5, 1)]),
             ("Local", "/b", "D", True, [("D/d.mkv", 5, 1), ("D/Subs/x.srt", 1, 1)])]
-    assert subtitles(rows, c) == [["en"], ["el"], None, []]
+    rows = [r + (d,) for r, d in zip(rows, recs)]
+    assert subtitles(rows) == [["en"], ["el"], None, []]
     assert calls == ["/b/A/a.mkv", "/b/B.mkv", "/b/C.mkv", "/b/D/d.mkv"]
-    assert "Local|/b/C.mkv|5|1" not in c["_subs"]  # failed probe: retried next run
+    assert recs[0]["Subs"] == {"Local|/b/A/a.mkv": {"size": 9, "mtime": 1, "langs": ["en"]}}
+    assert recs[2]["Subs"] == {}  # failed probe: retried next run
     calls.clear()
-    subtitles(rows, c)
-    assert calls == ["/b/C.mkv"]  # the rest came from the cache
+    subtitles(rows)
+    assert calls == ["/b/C.mkv"]  # the rest came from the records
+    calls.clear()
+    rows[0] = rows[0][:4] + ([("A/a.mkv", 9, 2)], recs[0])  # touched: probe again
+    subtitles(rows)
+    assert calls == ["/b/A/a.mkv", "/b/C.mkv"] and len(recs[0]["Subs"]) == 1
     globals()["_probe_local"] = saved_probe
-    assert purge_cache(c) == (0, 0) and "_subs" in c
 
     def _msubs(a, b):
         es = [build_entry("r", "T", "2000", "movie", miss, subs=x) for x in (a, b)]
@@ -1602,7 +1611,7 @@ def main():
                 (raw, title, year, typ, data, source, watched, base, mtime, is_dir, files)
             )
         original_titles([p[4] for p in pending])
-        subs = subtitles([(p[5], p[7], p[0], p[9], p[10]) for p in pending], cache)
+        subs = subtitles([(p[5], p[7], p[0], p[9], p[10], p[4]) for p in pending])
         for (raw, title, year, typ, data, source, watched, base, mtime, is_dir, _), sub in zip(
             pending, subs
         ):
