@@ -21,6 +21,9 @@ python3 build.py --install-handler  # once: make the page's ▶ Play buttons ope
 
 ▶ Play links use a `movies-play://` scheme that `--install-handler` registers
 (`~/.local/share/applications/movies-play.desktop`, run as `movies-db --play`).
+The Firefox snap opens such links through xdg-desktop-portal, whose "Open with"
+chooser never launched the handler, so `--install-handler` also stores the
+choice in the portal's permission store (`desktop-used-apps`) to skip it.
 NAS copies play from the SMB share through GNOME's gvfs mount, mounted on demand
 with the login saved in the keyring: open `smb://saronic.local/` in Files once
 and save the password. Override the host with `SARONIC_SMB`.

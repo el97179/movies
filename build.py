@@ -1704,6 +1704,21 @@ def install_handler():
     )
     subprocess.run(["xdg-mime", "default", HANDLER.name, "x-scheme-handler/movies-play"],
                    check=True)
+    # Sandboxed browsers (the Firefox snap) open links through xdg-desktop-portal, which
+    # for a non-web scheme shows an "Open with" chooser that never launched the handler
+    # here. A remembered choice used >= threshold times (count 3, threshold 3) skips it.
+    for app in ("snap.firefox", ""):  # "" = unsandboxed callers
+        try:
+            subprocess.run(
+                ["gdbus", "call", "--session",
+                 "--dest", "org.freedesktop.impl.portal.PermissionStore",
+                 "--object-path", "/org/freedesktop/impl/portal/PermissionStore",
+                 "--method", "org.freedesktop.impl.portal.PermissionStore.SetPermission",
+                 "desktop-used-apps", "true", "x-scheme-handler/movies-play", app,
+                 f"['{HANDLER.stem}', '3', '3']"],
+                capture_output=True, timeout=10, check=True)
+        except (subprocess.SubprocessError, OSError) as e:
+            print(f"  [info] portal choice for {app or 'host apps'} not set: {e}")
     print(f"movies-play:// -> {exe} --play ({HANDLER})")
 
 
