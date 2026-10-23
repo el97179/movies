@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+import unicodedata
 import urllib.request
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -377,6 +378,63 @@ def _get(params):
         return {"Response": "False", "Error": str(e), "transient": True}
 
 
+WIKIDATA_Q = """SELECT ?imdb ?title ?lang WHERE { VALUES ?imdb { %s }
+  ?item wdt:P345 ?imdb . OPTIONAL { ?item wdt:P1476 ?title . }
+  OPTIONAL { ?item wdt:P364/wdt:P218 ?lang . } }"""
+
+
+def _same(a, b):  # unicode-aware, unlike _norm: Greek/Cyrillic titles must not all be ""
+    # NFKD splits off accents, which [\W_] then drops: "Fantômas" is just "Fantomas"
+    key = lambda s: re.sub(r"[\W_]", "", unicodedata.normalize("NFKD", (s or "").lower()))
+    return key(a) == key(b)
+
+
+def pick_original(title, rows):
+    """rows: (title, title_lang, original_lang) from Wikidata. A title only counts in one of
+    the film's original languages ("Dark" carries an English "Dark hosen"), and never in
+    English: OMDb's title already is, so an English one is a variant ("Kill Bill Volume 2").
+    If OMDb's title is one of them it already is original; else take one ("Zorba the
+    Greek": Αλέξης Ζορμπάς, though Wikidata lists the film as both en and el)."""
+    langs = {o for _, _, o in rows if o}
+    ok = sorted({t for t, l, _ in rows if t and l != "en" and (l in langs or not langs)})
+    if any(_same(t, title) for t in ok):
+        return ""
+    return (ok or [""])[0]
+
+
+def original_titles(records):
+    """Set "OrigTitle" on each OMDb record lacking it, in place: one Wikidata query per 200
+    IDs, so it rides in cache.json with the record and costs one lookup per title, ever."""
+    todo = {}
+    for d in records:
+        if d.get("Response") == "True" and "OrigTitle" not in d and d.get("imdbID"):
+            todo.setdefault(d["imdbID"], []).append(d)
+    ids = list(todo)
+    for i in range(0, len(ids), 200):
+        chunk = ids[i : i + 200]
+        q = WIKIDATA_Q % " ".join(f'"{x}"' for x in chunk)
+        req = urllib.request.Request(
+            "https://query.wikidata.org/sparql",
+            data=urllib.parse.urlencode({"query": q, "format": "json"}).encode(),
+            headers={"User-Agent": "movies-db/1.0 (personal film catalogue)"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                bindings = json.load(r)["results"]["bindings"]
+        except Exception as e:  # transient: leave them unset, retried next run
+            print(f"  [info] Wikidata original titles skipped: {e}")
+            return
+        rows = {x: [] for x in chunk}  # an ID Wikidata doesn't know caches as ""
+        for b in bindings:
+            t = b.get("title", {})
+            rows[b["imdb"]["value"]].append(
+                (t.get("value"), t.get("xml:lang"), b.get("lang", {}).get("value"))
+            )
+        for x, rs in rows.items():
+            for d in todo[x]:
+                d["OrigTitle"] = pick_original(d.get("Title", ""), rs)
+
+
 def rt_rating(data):
     for r in data.get("Ratings", []):
         if r.get("Source") == "Rotten Tomatoes":
@@ -406,8 +464,11 @@ def build_entry(
     q = urllib.parse.quote_plus(f"{disp_title} {disp_year} trailer".strip())
     poster = data.get("Poster", "")
     span = re.sub(r"[–—]", "-", disp_year)  # OMDb uses an en dash: "2008–2011"
+    orig = data.get("OrigTitle", "") if matched else ""
     return {
         "title": disp_title,
+        # original-language title (Wikidata), only when it isn't just the displayed one
+        "orig": "" if _same(orig, disp_title) else orig,
         "year": re.sub(r"\D.*$", "", disp_year)
         or "",  # "2024–" -> "2024", for sort/merge
         # a series' run: "2008-2013" finished, "2008-" still airing. "" for movies.
@@ -631,6 +692,7 @@ function openZoom(m){
     <div class="zposter" style="${m.poster?`background-image:url('${esc(m.poster)}')`:''}">${m.poster?'':esc(m.title)}</div>
     <div class="zinfo">
       <div class="t" style="font-size:18px">${esc(m.title)} ${yr?`<span class="meta">(${esc(yr)})</span>`:''}</div>
+      ${m.orig?`<div class="meta"><i>${esc(m.orig)}</i></div>`:''}
       ${m.genre?`<div class="meta">${esc(m.genre)}</div>`:''}
       ${m.runtime&&m.runtime!=='N/A'?`<div class="meta">⏱ ${esc(m.runtime)}</div>`:''}
       ${m.seasons?`<div class="meta">📺 ${esc(m.seasons)} season${m.seasons!=='1'?'s':''}</div>`:''}
@@ -656,12 +718,13 @@ const gtok=m=>(m.genre||'').split(',').map(t=>t.trim()).filter(t=>t&&t!=='N/A');
   genreList.appendChild(l);
 });
 const num=v=>{const n=parseFloat(v);return isNaN(n)?-1:n};
+const fold=s=>s.normalize('NFD').replace(/\p{M}/gu,'').toLowerCase();  // "zorbas" finds Ζορμπάς
 function render(){
-  const term=q.value.toLowerCase(), key=sortSel.value;
+  const term=fold(q.value), key=sortSel.value;
   const srcs=new Set([cLocal.checked&&'Local',cSaronic.checked&&'Saronic',cWD.checked&&'WD'].filter(Boolean));
   const gsel=new Set([...genreList.querySelectorAll('input:checked')].map(i=>i.value));
   genreSum.textContent=gsel.size?'Genres ('+gsel.size+')':'Genres';
-  let rows=DATA.filter(m=>(m.title+' '+m.director+' '+m.actors).toLowerCase().includes(term)
+  let rows=DATA.filter(m=>fold(m.title+' '+m.orig+' '+m.director+' '+m.actors).includes(term)
     &&(m.type==='series'?cSeries.checked:cMovies.checked)
     &&m.sources.some(s=>srcs.has(s))
     &&m.watched===cWatched.checked
@@ -698,6 +761,7 @@ function card(m,i){
       <div class="t">${esc(m.title)} ${yr?`<span class="meta">(${esc(yr)})</span>`:''}</div>
       <button class="pen" title="Fix this entry">✎</button>
     </div>
+    ${m.orig?`<div class="meta"><i>${esc(m.orig)}</i></div>`:''}
     <div class="edit-box">
       <div class="edit-row">
         <input class="edit-field" data-field="title" value="${esc(cur.title??(m.matched?'':m.title))}" placeholder="title">
@@ -1154,6 +1218,22 @@ def selftest():
     assert _merged(100, None) == 100
     assert _merged(None, None) is None
 
+    # original title: only in an original language, preferring one that isn't OMDb's
+    zorba = [("Αλέξης Ζορμπάς", "el", "en"), ("Αλέξης Ζορμπάς", "el", "el"),
+             ("Zorba the Greek", "en", "en"), ("Zorba the Greek", "en", "el")]
+    assert pick_original("Zorba the Greek", zorba) == "Αλέξης Ζορμπάς"
+    assert pick_original("Dark", [("Dark hosen", "en", "de")]) == ""
+    assert pick_original("Severance", [("Severance", "en", "en")]) == ""
+    assert pick_original("Kill Bill: Vol. 2", [("Kill Bill Volume 2", "en", "en")]) == ""
+    assert pick_original("Porodica", [(None, None, "sr")]) == ""
+    assert pick_original("X", []) == ""
+    assert pick_original("Sirat", [("Sirāt", "es", "es"), ("صراط", "ar", "ar")]) == ""
+    assert pick_original("Dogtooth", [("Κυνόδοντας", "el", "el")]) == "Κυνόδοντας"
+    assert not _same("Αλέξης Ζορμπάς", "Ζ") and _same("Amici  Miei!", "amici miei")
+    assert _same("Fantômas", "Fantomas") and _same("Katyń", "Katyn")
+    hit = {"Response": "True", "Title": "Malena", "OrigTitle": "Malèna"}
+    assert build_entry("r", "T", None, "movie", hit)["orig"] == ""  # same: not shown
+
     # a real rename saves the moved correction and the log as it goes, not at the end
     global HERE, CORRECTIONS_FILE
     saved = HERE, CORRECTIONS_FILE
@@ -1208,7 +1288,7 @@ def main():
     if old:
         print(f"  [info] retrying {old} miss(es) recorded before the current search")
 
-    entries = []
+    entries, pending = [], []
     try:  # quota is spent per lookup: keep what this run paid for, even on Ctrl-C
         for raw, title, year, typ, source, watched, base, is_dir, mtime in scan():
             corr = corrections.get(raw, {})
@@ -1224,6 +1304,11 @@ def main():
                 f"  [{tag}] {title} [{typ}] [{source}]{' [watched]' if watched else ''}"
                 + (f" -- {data.get('Error')}" if data.get("transient") else "")
             )
+            pending.append(
+                (raw, title, year, typ, data, source, watched, base, mtime, is_dir)
+            )
+        original_titles([p[4] for p in pending])
+        for raw, title, year, typ, data, source, watched, base, mtime, is_dir in pending:
             entries.append(
                 build_entry(
                     raw, title, year, typ, data, source, watched, base, added=mtime,
