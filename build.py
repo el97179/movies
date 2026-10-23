@@ -725,15 +725,17 @@ function card(m,i){
       </div>
     </div></div>`;
 }
-dirBtn.onclick=()=>{asc=!asc;dirBtn.textContent=asc?'▲ Asc':'▼ Desc';render();};
+function setDir(a){asc=a;dirBtn.textContent=asc?'▲ Asc':'▼ Desc';}
+// derive direction from the sort key: newest first for "added", else Asc (also on load,
+// since a reload restores the dropdown without firing input)
+const dirFromKey=()=>setDir(sortSel.value!=='added');
+dirBtn.onclick=()=>{setDir(!asc);render();};
 q.addEventListener('input',render);
-sortSel.addEventListener('input',()=>{
-  if(sortSel.value==='added'){asc=false;dirBtn.textContent='▼ Desc';}
-  render();
-});
+sortSel.addEventListener('input',()=>{dirFromKey();render();});
 genreList.addEventListener('change',render);
 [cMovies,cSeries,cLocal,cSaronic,cWD,cWatched].forEach(el=>el.addEventListener('change',render));
 _save();
+dirFromKey();
 render();
 </script></body></html>
 """
