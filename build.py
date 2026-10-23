@@ -42,6 +42,7 @@ PICKUP = Path.home() / "Downloads" / "corrections.json"
 OUT = VIDEOS / "movies.html"
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".webm"}
+SUB_EXT = {".srt", ".sub", ".idx", ".ass", ".ssa", ".vtt"}
 # Release-tag tokens; first one marks where the real title ends (used when no year).
 JUNK = re.compile(
     r"\b(1080p|2160p|720p|480p|4k|bluray|brrip|bdrip|webrip|web-dl|webdl|web|hdrip|"
@@ -193,25 +194,54 @@ def _entry(name, is_dir, source, watched, base):
 
 
 def parse_remote_listing(out):
-    """Parse `ls -1p` output, optionally followed by a ::STAT:: section of
-    `mtime|name` lines. Returns [(name, is_dir, mtime_or_None)]."""
-    names, mtimes, in_stat = [], {}, False
+    """Parse `ls -1p` output, optionally followed by a ::STAT:: section of `mtime|name`
+    lines and a ::FILES:: section of `size|mtime|relpath` lines (video and subtitle files
+    under the base). Returns [(name, is_dir, mtime_or_None, own_files)]."""
+    names, mtimes, files, sect = [], {}, [], None
     for line in out.splitlines():
-        if line == "::STAT::":
-            in_stat = True
-        elif in_stat:
+        if line in ("::STAT::", "::FILES::"):
+            sect = line
+        elif sect == "::STAT::":
             parts = line.split("|", 1)
             if len(parts) == 2 and parts[0].isascii() and parts[0].isdigit():
                 mtimes[parts[1]] = int(parts[0])
+        elif sect == "::FILES::":
+            parts = line.split("|", 2)
+            try:
+                files.append((parts[2], int(parts[0]), int(float(parts[1]))))
+            except (IndexError, ValueError):
+                pass
         elif line.strip():
             names.append((line.rstrip("/"), line.endswith("/")))
-    return [(n, d, mtimes.get(n)) for n, d in names]
+    return [(n, d, mtimes.get(n), own_files(n, d, files)) for n, d in names]
+
+
+def own_files(raw, is_dir, files):
+    """The (relpath, size, mtime) files belonging to one entry: everything under a folder,
+    or a bare video plus the subtitle files beside it that share its stem."""
+    if is_dir:
+        return [f for f in files if f[0].startswith(raw + "/")]
+    stem = Path(raw).stem
+    return [
+        f
+        for f in files
+        if f[0] == raw
+        or ("/" not in f[0] and Path(f[0]).suffix.lower() in SUB_EXT
+            and f[0].startswith(stem))
+    ]
+
+
+_FIND_NAMES = " -o ".join(f"-iname '*{x}'" for x in sorted(VIDEO_EXT | SUB_EXT))
+# release folders nest Subs/ (and Fantomas a whole release dir) a few levels down
+FIND_FILES = (
+    r"find . -mindepth 1 -maxdepth 5 \( -path ./_watched -o -name @eaDir \) -prune"
+    rf" -o -type f \( {_FIND_NAMES} \) -printf '%s|%T@|%P\n'"
+)
 
 
 def remote_listing(path="~/Videos"):
     """Yield (name, is_dir, mtime) for a remote path over SSH; mtime is epoch
-    seconds or None. # ponytail: `ls -1p`, the trailing '/' marks dirs; swap to
-    `find` only if subfolders need walking."""
+    seconds or None, plus the entry's own files (see parse_remote_listing)."""
     if not SARONIC_IP:
         print("  [WARN] SARONIC_IP not set, skipping Saronic", file=sys.stderr)
         return
@@ -224,7 +254,8 @@ def remote_listing(path="~/Videos"):
                 "-o",
                 "ConnectTimeout=10",
                 SARONIC_IP,
-                f"ls -1p {path} && (echo ::STAT::; cd {path} && stat -c '%Y|%n' -- * 2>/dev/null; true)",
+                f"ls -1p {path} && (echo ::STAT::; cd {path} && stat -c '%Y|%n' -- *"
+                f" 2>/dev/null; echo ::FILES::; {FIND_FILES} 2>/dev/null; true)",
             ],
             capture_output=True,
             text=True,
@@ -262,21 +293,214 @@ def _local_mtime(child):
         return None
 
 
+def local_files(base):
+    """(relpath, size, mtime) of every video/subtitle file under base, like FIND_FILES."""
+    out = []
+    for root, dirs, names in os.walk(base):
+        dirs[:] = [d for d in dirs if not (d == "_watched" and root == str(base))
+                   and d != "@eaDir"]
+        for n in names:
+            if Path(n).suffix.lower() in VIDEO_EXT | SUB_EXT:
+                f = Path(root, n)
+                try:
+                    st = f.stat()
+                except OSError:  # dangling symlink
+                    continue
+                out.append((str(f.relative_to(base)), st.st_size, int(st.st_mtime)))
+    return out
+
+
 def scan():
-    """Yield (raw, title, year, type, source, watched, base_dir, is_dir, mtime) per library
-    entry; mtime is epoch seconds, or None when a remote stat is unavailable."""
+    """Yield (raw, title, year, type, source, watched, base_dir, is_dir, mtime, files) per
+    library entry; mtime is epoch seconds, or None when a remote stat is unavailable, and
+    files are the entry's (relpath, size, mtime) videos and subtitles."""
     for base, watched in ((VIDEOS, False), (VIDEOS / "_watched", True)):
         if not base.is_dir():
             continue
+        files = local_files(base)
         for child in sorted(base.iterdir()):
             e = _entry(child.name, child.is_dir(), "Local", watched, str(base))
             if e:
-                yield e + (_local_mtime(child),)
+                yield e + (_local_mtime(child), own_files(child.name, e[7], files))
     for path, source, watched in REMOTE_DIRS:
-        for name, is_dir, mtime in remote_listing(path):
+        for name, is_dir, mtime, own in remote_listing(path):
             e = _entry(name, is_dir, source, watched, path)
             if e:
-                yield e + (mtime,)
+                yield e + (mtime, own)
+
+
+_LANG_ROWS = """en eng english
+el gr gre ell greek
+es spa spanish
+fr fre fra french
+de ger deu german
+it ita italian
+pt por portuguese
+nl dut nld dutch
+sv swe swedish
+da dan danish
+no nor nob nno norwegian
+fi fin finnish
+pl pol polish
+ru rus russian
+uk ukr ukrainian
+tr tur turkish
+ja jpn japanese
+ko kor korean
+zh chi zho chinese
+ar ara arabic
+he heb hebrew
+fa per fas persian farsi
+sr srp serbian
+hr hrv croatian
+bs bos bosnian
+ro rum ron romanian
+hu hun hungarian
+cs cze ces czech
+bg bul bulgarian
+hin hindi
+th tha thai
+id ind indonesian
+ms may msa malay
+vi vie vietnamese
+et est estonian
+sl slv slovenian
+sk slo slk slovak
+lt lit lithuanian
+lv lav latvian
+mk mac mkd macedonian
+sq alb sqi albanian
+is ice isl icelandic
+ca cat catalan
+eu baq eus basque
+gl glg galician"""
+# alias -> 2-letter code ("hi" is left out: in sidecar names it means hearing impaired)
+LANG = {a: r.split()[0] for r in _LANG_ROWS.splitlines() for a in r.split()}
+LANG["hin"] = LANG["hindi"] = "hi"
+SUB_MARKERS = {"hi", "sdh", "cc", "forced", "full", "default"}
+SUB_STREAM = re.compile(r"Stream #\d+:\d+(?:\[0x[0-9a-f]+\])?(?:\((\w+)\))?: Subtitle")
+
+
+def sidecar_lang(name):
+    """Language of a subtitle file from the last two tokens of its name ("x_eng.srt",
+    "spa.HI.srt", "2_English.srt", "pt-brazil"), or None. Only known names count, so
+    "x264" or "BluRay" never pass for one."""
+    toks = re.split(r"[^a-z]+", Path(name).stem.lower())
+    toks = [t for t in toks if t and t not in SUB_MARKERS]
+    return next((LANG[t] for t in reversed(toks[-2:]) if t in LANG), None)
+
+
+def probe_langs(out):
+    """Subtitle stream languages from `ffprobe FILE` / `ffmpeg -i FILE` output ("und" when
+    untagged), or None if the file never opened -- a failed probe must not cache as "no
+    subtitles"."""
+    if "Input #0" not in out:
+        return None
+    return [LANG.get(t, t) if t else "und" for t in SUB_STREAM.findall(out)]
+
+
+PROBE_SH = r"""P=$(command -v ffprobe) || P=$(command -v ffmpeg) || { echo ::NOPROBE::; exit 0; }
+case $P in *ffmpeg) A=-i ;; *) A= ;; esac
+while IFS= read -r f; do
+  echo "::F::$f"; "$P" -hide_banner $A "$f" </dev/null 2>&1 | grep -E 'Input #|Stream #'
+done"""
+
+
+def parse_probe_batch(out):
+    """Split PROBE_SH output into {path: probe text}; None if the host has no prober."""
+    if "::NOPROBE::" in out:
+        return None
+    res, cur = {}, None
+    for line in out.splitlines():
+        if line.startswith("::F::"):
+            cur = line[5:]
+            res[cur] = ""
+        elif cur is not None:
+            res[cur] += line + "\n"
+    return res
+
+
+def _probe_local(paths, done):
+    for path in paths:
+        try:
+            r = subprocess.run(["ffprobe", "-hide_banner", path], capture_output=True,
+                               text=True, timeout=60)
+        except FileNotFoundError:
+            print("  [info] ffprobe not installed: local subtitles from sidecars only")
+            return
+        except subprocess.SubprocessError:
+            continue
+        done(path, r.stderr)
+
+
+def _probe_remote(paths, done):
+    # ~ doesn't expand inside the quoted "$f": strip it, ssh starts in $HOME anyway
+    rel = {p[2:] if p.startswith("~/") else p: p for p in paths}
+    todo = list(rel)
+    for i in range(0, len(todo), 40):  # a chunk per call: a timeout loses 40, not all
+        chunk = todo[i : i + 40]
+        print(f"  [subs] probing {i + len(chunk)}/{len(todo)} on {SARONIC_IP}")
+        try:
+            r = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SARONIC_IP,
+                 PROBE_SH],
+                input="\n".join(chunk) + "\n", capture_output=True, text=True,
+                timeout=600,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            print(f"  [info] NAS subtitle probe failed, sidecars only: {e}")
+            return
+        got = parse_probe_batch(r.stdout)
+        if got is None:
+            print("  [info] no ffprobe/ffmpeg on the NAS: remote subtitles from sidecars only")
+            return
+        for f, out in got.items():
+            if f in rel:
+                done(rel[f], out)
+
+
+def subtitles(rows, cache):
+    """rows: (source, base, raw, is_dir, files). Returns per row None (no subtitles) or the
+    sorted languages found, [] when there are subtitles of unknown language. Sidecars are
+    re-listed every run; embedded streams are probed once per file, cached in
+    cache["_subs"] by path|size|mtime. # ponytail: probes only the largest video, so one
+    episode stands in for a whole series; probe every episode if packs turn out mixed."""
+    known = cache.setdefault("_subs", {})
+    mains, todo = [], {"Local": [], "remote": []}
+    for source, base, raw, is_dir, files in rows:
+        vids = [f for f in files if Path(f[0]).suffix.lower() in VIDEO_EXT]
+        path = key = None
+        if vids:
+            rel, size, mtime = max(vids, key=lambda f: f[1])
+            path = f"{base}/{rel}"
+            key = f"{source}|{path}|{size}|{mtime}"
+            if key not in known:
+                todo["Local" if source == "Local" else "remote"].append((path, key))
+        mains.append(key)
+
+    for kind, items in todo.items():
+        if not items:
+            continue
+        keys = dict(items)
+
+        def done(path, out):
+            langs = probe_langs(out)
+            if langs is not None:  # opened and read: worth keeping
+                known[keys[path]] = langs
+
+        (_probe_local if kind == "Local" else _probe_remote)(list(keys), done)
+
+    out = []
+    for (source, base, raw, is_dir, files), key in zip(rows, mains):
+        subs = [f[0] for f in files if Path(f[0]).suffix.lower() in SUB_EXT]
+        stem = "" if is_dir else Path(raw).stem
+        langs = {sidecar_lang(Path(f).name[len(stem):] if stem else Path(f).name)
+                 for f in subs}
+        emb = known.get(key)
+        langs |= set(emb or [])
+        langs -= {None, "und"}
+        out.append(sorted(langs) if subs or emb else None)
+    return out
 
 
 # Bump when the lookup logic gets smarter: negatives cached by an older, dumber search
@@ -307,7 +531,8 @@ def purge_cache(cache):
     stale = [
         k
         for k, v in cache.items()
-        if v.get("Response") != "True" and v.get("Error") != NOT_FOUND["Error"]
+        if k != "_subs"  # subtitle probes, not OMDb records
+        and v.get("Response") != "True" and v.get("Error") != NOT_FOUND["Error"]
     ]
     old = [
         k
@@ -453,6 +678,7 @@ def build_entry(
     base="",
     added=None,
     is_dir=False,
+    subs=None,
 ):
     matched = data.get("Response") == "True"
     disp_title = data.get("Title") if matched else title
@@ -493,6 +719,7 @@ def build_entry(
         "paths": [[source, base, raw, is_dir]],  # one per physical copy, for --rename
         "watched": watched,
         "added": added,  # epoch seconds (folder mtime) or None
+        "subs": subs,  # None: no subtitles; else languages, [] if none are known
     }
 
 
@@ -515,6 +742,8 @@ def merge_duplicates(entries):
                 m["watched"] = True
             known = [a for a in (m["added"], e["added"]) if a is not None]
             m["added"] = min(known) if known else None
+            if e["subs"] is not None:  # explicit: [] (unknown language) still counts
+                m["subs"] = sorted(set(m["subs"] or []) | set(e["subs"]))
     return [seen[k] for k in order]
 
 
@@ -560,6 +789,7 @@ HTML = """<!doctype html>
   .nomatch{color:#d98b3a;border-color:#6e4a1c}
   .loc{color:#8be0a4;border-color:#1c6e3a}
   .watched-badge{color:#6ee7b7;border-color:#065f46}
+  .subs{color:#4ade80;border-color:#166534}
   .card.watched{opacity:.5;filter:grayscale(40%)}
   .card.watched:hover{opacity:.85;filter:none}
   a.trailer{margin-top:auto;text-align:center;padding:8px;border-radius:8px;
@@ -718,7 +948,7 @@ const gtok=m=>(m.genre||'').split(',').map(t=>t.trim()).filter(t=>t&&t!=='N/A');
   genreList.appendChild(l);
 });
 const num=v=>{const n=parseFloat(v);return isNaN(n)?-1:n};
-const fold=s=>s.normalize('NFD').replace(/\p{M}/gu,'').toLowerCase();  // "zorbas" finds Ζορμπάς
+const fold=s=>s.normalize('NFD').replace(/\\p{M}/gu,'').toLowerCase();  // "zorbas" finds Ζορμπάς
 function render(){
   const term=fold(q.value), key=sortSel.value;
   const srcs=new Set([cLocal.checked&&'Local',cSaronic.checked&&'Saronic',cWD.checked&&'WD'].filter(Boolean));
@@ -751,6 +981,7 @@ function card(m,i){
     !m.matched?`<span class="b nomatch" title="${esc(m.raw)}">no match</span>`:'',
     ...m.sources.map(s=>`<span class="b loc">📍 ${esc(s)}</span>`),
     m.watched?`<span class="b watched-badge">✓ Watched</span>`:'',
+    m.subs?`<span class="b subs" title="${esc(m.subs.length?'Subtitles: '+m.subs.join(', '):'Subtitles (language unknown)')}">✓ Subs</span>`:'',
   ].join('');
   const yr=m.years||m.year;
   const raws=m.paths.map(p=>p[2]);
@@ -1175,16 +1406,25 @@ def selftest():
         assert parse_name(n) == want, (n, parse_name(n))
     # remote listing: names + optional mtimes, failing soft to None
     assert parse_remote_listing("a/\nb.mkv\n::STAT::\n100|a\n200|b.mkv\n") == [
-        ("a", True, 100),
-        ("b.mkv", False, 200),
+        ("a", True, 100, []),
+        ("b.mkv", False, 200, []),
     ]
-    assert parse_remote_listing("a/\n") == [("a", True, None)]
+    assert parse_remote_listing("a/\n") == [("a", True, None, [])]
     assert parse_remote_listing("a/\n::STAT::\nnot-a-line\nx|a\n") == [
-        ("a", True, None)
+        ("a", True, None, [])
     ]
-    assert parse_remote_listing("x|y/\n::STAT::\n5|x|y\n") == [("x|y", True, 5)]
+    assert parse_remote_listing("x|y/\n::STAT::\n5|x|y\n") == [("x|y", True, 5, [])]
 
-    assert parse_remote_listing("a/\n::STAT::\n²|a\n") == [("a", True, None)]
+    assert parse_remote_listing("a/\n::STAT::\n²|a\n") == [("a", True, None, [])]
+    # ::FILES:: hands each entry its own videos/subtitles; a bare video gets its siblings
+    lst = parse_remote_listing(
+        "A/\nM.mkv\n::STAT::\n::FILES::\n9|1.5|A/a.mkv\n1|2.0|A/Subs/eng.srt\n"
+        "8|3|M.mkv\n1|4|M.el.srt\n1|4|Other.srt\nbroken\n"
+    )
+    assert lst == [
+        ("A", True, None, [("A/a.mkv", 9, 1), ("A/Subs/eng.srt", 1, 2)]),
+        ("M.mkv", False, None, [("M.mkv", 8, 3), ("M.el.srt", 1, 4)]),
+    ], lst
 
     # a dangling symlink must give mtime None, not crash the scan
     with tempfile.TemporaryDirectory() as td:
@@ -1217,6 +1457,60 @@ def selftest():
     assert _merged(None, 100) == 100
     assert _merged(100, None) == 100
     assert _merged(None, None) is None
+
+    # subtitles: sidecar names, probe output (NAS ffmpeg and newer ffprobe), and caching
+    assert sidecar_lang("City.of.God.2002.1080p.BluRay.x264.anoXmous_eng.srt") == "en"
+    assert sidecar_lang("spa.HI.srt") == "es" and sidecar_lang("2_English.srt") == "en"
+    assert sidecar_lang("Don Juan (1948).portuguese-brazil.srt") == "pt"
+    assert sidecar_lang("Die.Hard.BluRay.1080p.x264.5.1.Judas.srt") is None
+    assert sidecar_lang("The.Three.Faces.of.Eve.1957..srt") is None
+    assert sidecar_lang(".el.srt") == "el"  # a bare video's sibling, stem cut off
+    assert sidecar_lang("Before Night Falls.2000.DVDRip-gr.srt") == "el"
+    crimson = """Input #0, matroska,webm, from 'x.mkv':
+    Stream #0:1(spa): Audio: ac3, 48000 Hz, stereo, 192 kb/s (default)
+    Stream #0:3(spa): Subtitle: subrip
+    Stream #0:4(eng): Subtitle: subrip
+    Stream #0:5(fre): Subtitle: subrip (forced)
+  Stream #0:2[0x3](gre): Subtitle: mov_text (default)
+  Stream #0:6: Subtitle: hdmv_pgs_subtitle
+  Stream #0:7(xyz): Subtitle: subrip"""
+    assert probe_langs(crimson) == ["es", "en", "fr", "el", "und", "xyz"]
+    assert probe_langs("Input #0, avi\n  Stream #0:0: Video: mpeg4") == []
+    assert probe_langs("x.mkv: Input/output error") is None  # never cached as "none"
+    assert parse_probe_batch("::NOPROBE::\n") is None
+    assert parse_probe_batch("::F::a b.mkv\nInput #0\n::F::c\n") == {
+        "a b.mkv": "Input #0\n", "c": ""}
+    calls = []
+    saved_probe = _probe_local
+
+    def _fake(paths, done):
+        calls.extend(paths)
+        for path in paths:
+            done(path, {"/b/A/a.mkv": "Input #0\n Stream #0:2(eng): Subtitle: x",
+                        "/b/B.mkv": "Input #0\n", "/b/D/d.mkv": "Input #0\n"}.get(
+                            path, "broken"))
+
+    globals()["_probe_local"] = _fake
+    c = {}
+    rows = [("Local", "/b", "A", True, [("A/a.mkv", 9, 1), ("A/s.mkv", 1, 1)]),
+            ("Local", "/b", "B.mkv", False, [("B.mkv", 5, 1), ("B.Greek.srt", 1, 1)]),
+            ("Local", "/b", "C.mkv", False, [("C.mkv", 5, 1)]),
+            ("Local", "/b", "D", True, [("D/d.mkv", 5, 1), ("D/Subs/x.srt", 1, 1)])]
+    assert subtitles(rows, c) == [["en"], ["el"], None, []]
+    assert calls == ["/b/A/a.mkv", "/b/B.mkv", "/b/C.mkv", "/b/D/d.mkv"]
+    assert "Local|/b/C.mkv|5|1" not in c["_subs"]  # failed probe: retried next run
+    calls.clear()
+    subtitles(rows, c)
+    assert calls == ["/b/C.mkv"]  # the rest came from the cache
+    globals()["_probe_local"] = saved_probe
+    assert purge_cache(c) == (0, 0) and "_subs" in c
+
+    def _msubs(a, b):
+        es = [build_entry("r", "T", "2000", "movie", miss, subs=x) for x in (a, b)]
+        return merge_duplicates(es)[0]["subs"]
+
+    assert _msubs(None, []) == [] and _msubs(["en"], ["el"]) == ["el", "en"]
+    assert _msubs(None, None) is None
 
     # original title: only in an original language, preferring one that isn't OMDb's
     zorba = [("Αλέξης Ζορμπάς", "el", "en"), ("Αλέξης Ζορμπάς", "el", "el"),
@@ -1290,7 +1584,7 @@ def main():
 
     entries, pending = [], []
     try:  # quota is spent per lookup: keep what this run paid for, even on Ctrl-C
-        for raw, title, year, typ, source, watched, base, is_dir, mtime in scan():
+        for raw, title, year, typ, source, watched, base, is_dir, mtime, files in scan():
             corr = corrections.get(raw, {})
             if corr.get("ignore"):
                 continue
@@ -1305,14 +1599,17 @@ def main():
                 + (f" -- {data.get('Error')}" if data.get("transient") else "")
             )
             pending.append(
-                (raw, title, year, typ, data, source, watched, base, mtime, is_dir)
+                (raw, title, year, typ, data, source, watched, base, mtime, is_dir, files)
             )
         original_titles([p[4] for p in pending])
-        for raw, title, year, typ, data, source, watched, base, mtime, is_dir in pending:
+        subs = subtitles([(p[5], p[7], p[0], p[9], p[10]) for p in pending], cache)
+        for (raw, title, year, typ, data, source, watched, base, mtime, is_dir, _), sub in zip(
+            pending, subs
+        ):
             entries.append(
                 build_entry(
                     raw, title, year, typ, data, source, watched, base, added=mtime,
-                    is_dir=is_dir,
+                    is_dir=is_dir, subs=sub,
                 )
             )
     finally:
