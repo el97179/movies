@@ -822,9 +822,11 @@ HTML = """<!doctype html>
   .card.watched{opacity:.5;filter:grayscale(40%)}
   .card.watched:hover{opacity:.85;filter:none}
   a.trailer{margin-top:auto;text-align:center;padding:8px;border-radius:8px;
-    background:#b91c1c;color:#fff;text-decoration:none;font-size:13px}
-  a.trailer.play{background:#15803d}
-  a.trailer:hover{filter:brightness(1.2)}  /* same hue, a touch lighter: Play stays green */
+    background:transparent;border:1px solid #363b47;color:#e8e8e8;text-decoration:none;
+    font-size:13px}
+  a.trailer:hover{background:#262b36}  /* secondary: outlined, a faint fill on hover */
+  a.trailer.play{background:#15803d;border-color:#15803d;color:#fff}  /* the main action */
+  a.trailer.play:hover{background:#15803d;filter:brightness(1.2)}  /* same green, lighter */
   .sep{width:1px;height:24px;background:#2c303a;align-self:center}
   label.cb{display:flex;align-items:center;gap:5px;font-size:13px;cursor:pointer;white-space:nowrap}
   label.cb input{accent-color:#6ee7b7;width:15px;height:15px;cursor:pointer}
