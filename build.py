@@ -706,7 +706,6 @@ def build_entry(
     # matched, a nearby year in the name is the original release: keep it.
     if matched and year and disp_year.isdigit() and abs(int(disp_year) - int(year)) <= 2:
         disp_year = year
-    q = urllib.parse.quote_plus(f"{disp_title} {disp_year} trailer".strip())
     poster = data.get("Poster", "")
     span = re.sub(r"[–—]", "-", disp_year)  # OMDb uses an en dash: "2008–2011"
     orig = data.get("OrigTitle", "") if matched else ""
@@ -735,7 +734,6 @@ def build_entry(
         "runtime": (data.get("Runtime") or "") if matched else "",
         "seasons": (data.get("totalSeasons") or "") if matched else "",
         "poster": poster if poster and poster != "N/A" else "",
-        "trailer": f"https://www.youtube.com/results?search_query={q}",
         "matched": matched,
         "raw": raw,
         "sources": [source],
@@ -821,12 +819,9 @@ HTML = """<!doctype html>
   .subs{color:#4ade80;border-color:#166534}
   .card.watched{opacity:.5;filter:grayscale(40%)}
   .card.watched:hover{opacity:.85;filter:none}
-  a.trailer{margin-top:auto;text-align:center;padding:8px;border-radius:8px;
-    background:transparent;border:1px solid #363b47;color:#e8e8e8;text-decoration:none;
-    font-size:13px}
-  a.trailer:hover{background:#262b36}  /* secondary: outlined, a faint fill on hover */
-  a.trailer.play{background:#15803d;border-color:#15803d;color:#fff}  /* the main action */
-  a.trailer.play:hover{background:#15803d;filter:brightness(1.2)}  /* same green, lighter */
+  a.play{margin-top:auto;text-align:center;padding:8px;border-radius:8px;
+    background:#15803d;color:#fff;text-decoration:none;font-size:13px}
+  a.play:hover{filter:brightness(1.2)}  /* same green, a touch lighter */
   .sep{width:1px;height:24px;background:#2c303a;align-self:center}
   label.cb{display:flex;align-items:center;gap:5px;font-size:13px;cursor:pointer;white-space:nowrap}
   label.cb input{accent-color:#6ee7b7;width:15px;height:15px;cursor:pointer}
@@ -964,7 +959,6 @@ function openZoom(m){
       ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
       ${m.plot&&m.plot!=='N/A'?`<p style="line-height:1.5">${esc(m.plot)}</p>`:'<p class="meta">No plot available.</p>'}
       <div style="display:flex;gap:6px">
-        <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">Trailer</a>
         ${playBtn(m)}
       </div>
     </div>`;
@@ -1009,7 +1003,7 @@ const PREF=['Local','Saronic','WD'];
 function playBtn(m){
   const [src,path]=[...m.play].sort((a,b)=>PREF.indexOf(a[0])-PREF.indexOf(b[0]))[0];
   const href='movies-play://play?src='+encodeURIComponent(src)+'&path='+encodeURIComponent(path);
-  return `<a class="trailer play" style="flex:1" href="${esc(href)}" title="Play in VLC (${esc(src)})">▶ Play</a>`;
+  return `<a class="play" style="flex:1" href="${esc(href)}" title="Play in VLC (${esc(src)})">▶ Play</a>`;
 }
 // the 🍅 rating opens the film's RT page (ID from Wikidata), else an RT search
 function ratings(m){
@@ -1065,7 +1059,6 @@ function card(m,i){
       ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
       ${m.plot&&m.plot!=='N/A'?`<details class="plot"><summary></summary><p>${esc(m.plot)}</p></details>`:''}
       <div style="display:flex;gap:6px;margin-top:auto">
-        <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">Trailer</a>
         ${playBtn(m)}
       </div>
     </div></div>`;

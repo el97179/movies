@@ -80,7 +80,7 @@ this laptop's `~/Downloads` is picked up, so copy a fix file over by hand.
   or an RT search when Wikidata has no RT ID), where each copy is, ✓ Watched, ✓ Subs,
   genre, runtime, seasons, "Added in <year>", director, actors and plot.
 - **Click the poster** for a larger view with the full plot.
-- **Trailer** opens a YouTube search; **▶ Play** opens the video in VLC (see below).
+- **▶ Play** opens the video in VLC (see below).
 
 ### ✓ Subs
 
