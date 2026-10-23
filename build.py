@@ -613,9 +613,10 @@ def _get(params):
         return {"Response": "False", "Error": str(e), "transient": True}
 
 
-WIKIDATA_Q = """SELECT ?imdb ?title ?lang WHERE { VALUES ?imdb { %s }
+# P345 IMDb ID, P1476 title, P364/P218 original language code, P1258 Rotten Tomatoes ID
+WIKIDATA_Q = """SELECT ?imdb ?title ?lang ?rt WHERE { VALUES ?imdb { %s }
   ?item wdt:P345 ?imdb . OPTIONAL { ?item wdt:P1476 ?title . }
-  OPTIONAL { ?item wdt:P364/wdt:P218 ?lang . } }"""
+  OPTIONAL { ?item wdt:P364/wdt:P218 ?lang . } OPTIONAL { ?item wdt:P1258 ?rt . } }"""
 
 
 def _same(a, b):  # unicode-aware, unlike _norm: Greek/Cyrillic titles must not all be ""
@@ -637,12 +638,14 @@ def pick_original(title, rows):
     return (ok or [""])[0]
 
 
-def original_titles(records):
-    """Set "OrigTitle" on each OMDb record lacking it, in place: one Wikidata query per 200
-    IDs, so it rides in cache.json with the record and costs one lookup per title, ever."""
+def wikidata(records):
+    """Set "OrigTitle" and "RTid" (Rotten Tomatoes path, "m/goldeneye") on each OMDb record
+    lacking them, in place: one Wikidata query per 200 IDs, so they ride in cache.json with
+    the record and cost one lookup per title, ever."""
     todo = {}
     for d in records:
-        if d.get("Response") == "True" and "OrigTitle" not in d and d.get("imdbID"):
+        if (d.get("Response") == "True" and d.get("imdbID")
+                and ("OrigTitle" not in d or "RTid" not in d)):
             todo.setdefault(d["imdbID"], []).append(d)
     ids = list(todo)
     for i in range(0, len(ids), 200):
@@ -657,17 +660,22 @@ def original_titles(records):
             with urllib.request.urlopen(req, timeout=60) as r:
                 bindings = json.load(r)["results"]["bindings"]
         except Exception as e:  # transient: leave them unset, retried next run
-            print(f"  [info] Wikidata original titles skipped: {e}")
+            print(f"  [info] Wikidata original titles / RT links skipped: {e}")
             return
         rows = {x: [] for x in chunk}  # an ID Wikidata doesn't know caches as ""
+        rts = {x: set() for x in chunk}
         for b in bindings:
-            t = b.get("title", {})
-            rows[b["imdb"]["value"]].append(
+            t, x = b.get("title", {}), b["imdb"]["value"]
+            rows[x].append(
                 (t.get("value"), t.get("xml:lang"), b.get("lang", {}).get("value"))
             )
+            if "rt" in b:
+                rts[x].add(b["rt"]["value"])
         for x, rs in rows.items():
             for d in todo[x]:
                 d["OrigTitle"] = pick_original(d.get("Title", ""), rs)
+                # a film can carry two ("m/apocalypse_now", "..._redux_2001"): the shorter
+                d["RTid"] = min(rts[x], key=lambda r: (len(r), r), default="")
 
 
 def rt_rating(data):
@@ -717,6 +725,9 @@ def build_entry(
         "genre": data.get("Genre", "") if matched else "",
         "imdb": data.get("imdbRating", "") if matched else "",
         "rt": rt_rating(data) if matched else "",
+        "rt_url": f"https://www.rottentomatoes.com/{data['RTid']}"
+        if matched and data.get("RTid")
+        else "",
         "imdb_url": f"https://www.imdb.com/title/{data['imdbID']}/"
         if matched and data.get("imdbID")
         else "",
@@ -998,12 +1009,13 @@ function playBtn(m){
   const href='movies-play://play?src='+encodeURIComponent(src)+'&path='+encodeURIComponent(path);
   return `<a class="trailer play" style="flex:1" href="${esc(href)}" title="Play in VLC (${esc(src)})">▶ Play</a>`;
 }
-// OMDb has no Rotten Tomatoes page URL: the 🍅 rating links to an RT search instead
+// the 🍅 rating opens the film's RT page (ID from Wikidata), else an RT search
 function ratings(m){
   const ext=(href,cls,txt,tip)=>`<a class="b ${cls}" href="${esc(href)}" target="_blank" rel="noopener" title="${tip}">${txt}</a>`;
   return [
     m.imdb?(m.imdb_url?ext(m.imdb_url,'imdb','IMDb '+esc(m.imdb),'Open on IMDb'):`<span class="b imdb">IMDb ${esc(m.imdb)}</span>`):'',
-    m.rt?ext('https://www.rottentomatoes.com/search?search='+encodeURIComponent(m.title),'rt','🍅 '+esc(m.rt),'Search Rotten Tomatoes'):'',
+    m.rt?(m.rt_url?ext(m.rt_url,'rt','🍅 '+esc(m.rt),'Open on Rotten Tomatoes')
+      :ext('https://www.rottentomatoes.com/search?search='+encodeURIComponent(m.title),'rt','🍅 '+esc(m.rt),'Search Rotten Tomatoes')):'',
   ].join('');
 }
 function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -1583,7 +1595,10 @@ def selftest():
     assert pick_original("Dogtooth", [("Κυνόδοντας", "el", "el")]) == "Κυνόδοντας"
     assert not _same("Αλέξης Ζορμπάς", "Ζ") and _same("Amici  Miei!", "amici miei")
     assert _same("Fantômas", "Fantomas") and _same("Katyń", "Katyn")
-    hit = {"Response": "True", "Title": "Malena", "OrigTitle": "Malèna"}
+    hit = {"Response": "True", "Title": "Malena", "OrigTitle": "Malèna", "RTid": "m/malena"}
+    assert build_entry("r", "T", None, "movie", hit)["rt_url"] == (
+        "https://www.rottentomatoes.com/m/malena")
+    assert build_entry("r", "T", None, "movie", miss)["rt_url"] == ""
     assert build_entry("r", "T", None, "movie", hit)["orig"] == ""  # same: not shown
 
     # a real rename saves the moved correction and the log as it goes, not at the end
@@ -1756,7 +1771,7 @@ def main():
             pending.append(
                 (raw, title, year, typ, data, source, watched, base, mtime, is_dir, files)
             )
-        original_titles([p[4] for p in pending])
+        wikidata([p[4] for p in pending])
         subs = subtitles([(p[5], p[7], p[0], p[9], p[10], p[4]) for p in pending])
         for (raw, title, year, typ, data, source, watched, base, mtime, is_dir, files), sub in zip(
             pending, subs
