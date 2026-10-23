@@ -949,8 +949,8 @@ function openZoom(m){
       ${m.plot&&m.plot!=='N/A'?`<p style="line-height:1.5">${esc(m.plot)}</p>`:'<p class="meta">No plot available.</p>'}
       <div style="display:flex;gap:6px">
         ${m.imdb_url?`<a class="trailer" style="flex:0 0 auto;background:#f5c518;color:#000" href="${esc(m.imdb_url)}" target="_blank" rel="noopener">IMDb</a>`:''}
-        ${playBtn(m)}
         <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">Trailer</a>
+        ${playBtn(m)}
       </div>
     </div>`;
   zoomBody.querySelector('#zoomClose').onclick=()=>zoom.close();
@@ -1043,8 +1043,8 @@ function card(m,i){
       ${m.plot&&m.plot!=='N/A'?`<details class="plot"><summary></summary><p>${esc(m.plot)}</p></details>`:''}
       <div style="display:flex;gap:6px;margin-top:auto">
         ${m.imdb_url?`<a class="trailer" style="flex:0 0 auto;background:#f5c518;color:#000" href="${esc(m.imdb_url)}" target="_blank" rel="noopener">IMDb</a>`:''}
-        ${playBtn(m)}
         <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">Trailer</a>
+        ${playBtn(m)}
       </div>
     </div></div>`;
 }
