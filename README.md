@@ -26,7 +26,9 @@ whichever way it's invoked: the symlink is resolved.
 ## Usage
 
 ```bash
-movies-db                      # scan + look up (cached) + write ~/Videos/movies.html
+movies-db                      # scan + look up (cached) + write ~/Videos/movies.html,
+                               # then copy it to the NAS: http://saronic.local/movies/
+movies-db --no-publish         # same, but don't copy it to the NAS
 movies-db --refresh            # ignore the cache and re-hit OMDb for every title (see below)
 movies-db --selftest           # parser and logic self-checks, no network
 movies-db --rename --dry-run   # show what --rename would change
@@ -54,6 +56,17 @@ An entry is a series when its name has `S01`, `Season N`, `Complete Series` or
 under a `series/` folder. Once OMDb matches it, OMDb's type wins.
 
 ## The page
+
+Each build also copies the page over SSH to the NAS's Web Station folder
+(`/volume1/web/movies/index.html`). Anyone on the home network can then open it at
+**http://saronic.local/movies/** (or `https://`), from any device. It's written to a
+temp file and moved into place, so a half-copied page is never served. If the NAS
+can't be reached, the build warns and finishes anyway. Skip the copy with
+`--no-publish`; the page isn't copied when an OMDb quota stop left it unbuilt.
+
+From other devices, ▶ Play does nothing: it needs `--install-handler` and VLC on the
+machine you click from. "Download fixes" saves to that device's Downloads, but only
+this laptop's `~/Downloads` is picked up, so copy a fix file over by hand.
 
 - **Search** matches the title, original title, director and actors, ignoring case and
   accents ("zorbas" finds *Ζορμπάς*). Plot isn't searched.

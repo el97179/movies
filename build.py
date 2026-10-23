@@ -1090,6 +1090,33 @@ def generate(entries, corrections):
     OUT.write_text(html, encoding="utf-8")
 
 
+NAS_WEB = "/volume1/web/movies"  # Web Station serves /volume1/web: http://<nas>/movies/
+
+
+def publish(page):
+    """Copy the page to the NAS's Web Station folder over SSH. Written to a temp file and
+    moved into place, so a dropped connection never leaves a half page being served.
+    Never fails the build: warns and returns, like the other NAS steps."""
+    if not SARONIC_IP:
+        return
+    tmp = f"{NAS_WEB}/.index.html.tmp"
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SARONIC_IP,
+             f"mkdir -p {NAS_WEB} && cat > {tmp} && chmod 644 {tmp}"
+             f" && mv -f {tmp} {NAS_WEB}/index.html"],
+            input=page.read_bytes(), capture_output=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"  [WARN] NAS publish failed, page kept locally: {e}", file=sys.stderr)
+        return
+    if r.returncode:
+        err = r.stderr.decode(errors="replace").strip()
+        print(f"  [WARN] NAS publish failed, page kept locally: {err}", file=sys.stderr)
+        return
+    print(f"  published -> http://{SMB_HOST}/movies/")
+
+
 IMDB_ID = re.compile(r"tt\d{7,}")
 
 
@@ -1739,6 +1766,8 @@ def main():
     ap.add_argument("--play", metavar="URL", help="open a movies-play:// link in VLC")
     ap.add_argument("--install-handler", action="store_true",
                     help="register movies-play:// so the page's Play buttons work")
+    ap.add_argument("--no-publish", action="store_true",
+                    help="don't copy the page to the NAS's Web Station folder")
     args = ap.parse_args()
     if args.selftest:
         selftest()
@@ -1822,6 +1851,8 @@ def main():
     generate(entries, corrections)
     matched = sum(e["matched"] for e in entries)
     print(f"\n{len(entries)} titles ({matched} matched) -> {OUT}")
+    if not args.no_publish:
+        publish(OUT)
 
 
 if __name__ == "__main__":
