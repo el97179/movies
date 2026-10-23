@@ -634,6 +634,7 @@ function openZoom(m){
       ${m.genre?`<div class="meta">${esc(m.genre)}</div>`:''}
       ${m.runtime&&m.runtime!=='N/A'?`<div class="meta">⏱ ${esc(m.runtime)}</div>`:''}
       ${m.seasons?`<div class="meta">📺 ${esc(m.seasons)} season${m.seasons!=='1'?'s':''}</div>`:''}
+      ${m.added!=null?`<div class="meta">Added in ${new Date(m.added*1000).getFullYear()}</div>`:''}
       ${m.director?`<div class="meta">Dir: ${esc(m.director)}</div>`:''}
       ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
       ${m.plot&&m.plot!=='N/A'?`<p style="line-height:1.5">${esc(m.plot)}</p>`:'<p class="meta">No plot available.</p>'}
@@ -716,6 +717,7 @@ function card(m,i){
       ${m.genre?`<div class="meta">${esc(m.genre)}</div>`:''}
       ${m.runtime&&m.runtime!=='N/A'?`<div class="meta">⏱ ${esc(m.runtime)}</div>`:''}
       ${m.seasons?`<div class="meta">📺 ${esc(m.seasons)} season${m.seasons!=='1'?'s':''}</div>`:''}
+      ${m.added!=null?`<div class="meta">Added in ${new Date(m.added*1000).getFullYear()}</div>`:''}
       ${m.director?`<div class="meta">Dir: ${esc(m.director)}</div>`:''}
       ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
       ${m.plot&&m.plot!=='N/A'?`<details class="plot"><summary></summary><p>${esc(m.plot)}</p></details>`:''}
