@@ -726,9 +726,9 @@ function card(m,i){
     </div></div>`;
 }
 function setDir(a){asc=a;dirBtn.textContent=asc?'▲ Asc':'▼ Desc';}
-// derive direction from the sort key: newest first for "added", else Asc (also on load,
-// since a reload restores the dropdown without firing input)
-const dirFromKey=()=>setDir(sortSel.value!=='added');
+// derive direction from the sort key: Asc for name, Desc (highest/newest first) for the rest;
+// also on load, since a reload restores the dropdown without firing input
+const dirFromKey=()=>setDir(sortSel.value==='title');
 dirBtn.onclick=()=>{setDir(!asc);render();};
 q.addEventListener('input',render);
 sortSel.addEventListener('input',()=>{dirFromKey();render();});
