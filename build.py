@@ -824,7 +824,7 @@ HTML = """<!doctype html>
   a.trailer{margin-top:auto;text-align:center;padding:8px;border-radius:8px;
     background:#b91c1c;color:#fff;text-decoration:none;font-size:13px}
   a.trailer.play{background:#15803d}
-  a.trailer:hover{background:#dc2626}
+  a.trailer:hover{filter:brightness(1.2)}  /* same hue, a touch lighter: Play stays green */
   .sep{width:1px;height:24px;background:#2c303a;align-self:center}
   label.cb{display:flex;align-items:center;gap:5px;font-size:13px;cursor:pointer;white-space:nowrap}
   label.cb input{accent-color:#6ee7b7;width:15px;height:15px;cursor:pointer}
