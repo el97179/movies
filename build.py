@@ -799,6 +799,8 @@ HTML = """<!doctype html>
   .meta{font-size:12px;color:#9aa3b2}
   .badges{display:flex;gap:6px;flex-wrap:wrap;font-size:12px}
   .b{padding:2px 7px;border-radius:6px;background:#0f1115;border:1px solid #363b47}
+  a.b{text-decoration:none}
+  a.b:hover{filter:brightness(1.3);text-decoration:underline}
   .imdb{color:#f5c518;border-color:#5a4d12}
   .rt{color:#fa320a;border-color:#5a2012}
   .series{color:#7cc4ff;border-color:#1c4a6e}
@@ -940,6 +942,7 @@ function openZoom(m){
     <div class="zinfo">
       <div class="t" style="font-size:18px">${esc(m.title)} ${yr?`<span class="meta">(${esc(yr)})</span>`:''}</div>
       ${m.orig?`<div class="meta"><i>${esc(m.orig)}</i></div>`:''}
+      ${m.imdb||m.rt?`<div class="badges">${ratings(m)}</div>`:''}
       ${m.genre?`<div class="meta">${esc(m.genre)}</div>`:''}
       ${m.runtime&&m.runtime!=='N/A'?`<div class="meta">⏱ ${esc(m.runtime)}</div>`:''}
       ${m.seasons?`<div class="meta">📺 ${esc(m.seasons)} season${m.seasons!=='1'?'s':''}</div>`:''}
@@ -948,7 +951,6 @@ function openZoom(m){
       ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
       ${m.plot&&m.plot!=='N/A'?`<p style="line-height:1.5">${esc(m.plot)}</p>`:'<p class="meta">No plot available.</p>'}
       <div style="display:flex;gap:6px">
-        ${m.imdb_url?`<a class="trailer" style="flex:0 0 auto;background:#f5c518;color:#000" href="${esc(m.imdb_url)}" target="_blank" rel="noopener">IMDb</a>`:''}
         <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">Trailer</a>
         ${playBtn(m)}
       </div>
@@ -996,12 +998,19 @@ function playBtn(m){
   const href='movies-play://play?src='+encodeURIComponent(src)+'&path='+encodeURIComponent(path);
   return `<a class="trailer play" style="flex:1" href="${esc(href)}" title="Play in VLC (${esc(src)})">▶ Play</a>`;
 }
+// OMDb has no Rotten Tomatoes page URL: the 🍅 rating links to an RT search instead
+function ratings(m){
+  const ext=(href,cls,txt,tip)=>`<a class="b ${cls}" href="${esc(href)}" target="_blank" rel="noopener" title="${tip}">${txt}</a>`;
+  return [
+    m.imdb?(m.imdb_url?ext(m.imdb_url,'imdb','IMDb '+esc(m.imdb),'Open on IMDb'):`<span class="b imdb">IMDb ${esc(m.imdb)}</span>`):'',
+    m.rt?ext('https://www.rottentomatoes.com/search?search='+encodeURIComponent(m.title),'rt','🍅 '+esc(m.rt),'Search Rotten Tomatoes'):'',
+  ].join('');
+}
 function esc(s){return (s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function card(m,i){
   const poster=m.poster?`style="background-image:url('${esc(m.poster)}')"`:'';
   const badges=[
-    m.imdb?`<span class="b imdb">IMDb ${esc(m.imdb)}</span>`:'',
-    m.rt?`<span class="b rt">🍅 ${esc(m.rt)}</span>`:'',
+    ratings(m),
     m.type==='series'?`<span class="b series">Series</span>`:'',
     !m.matched?`<span class="b nomatch" title="${esc(m.raw)}">no match</span>`:'',
     ...m.sources.map(s=>`<span class="b loc">📍 ${esc(s)}</span>`),
@@ -1042,7 +1051,6 @@ function card(m,i){
       ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
       ${m.plot&&m.plot!=='N/A'?`<details class="plot"><summary></summary><p>${esc(m.plot)}</p></details>`:''}
       <div style="display:flex;gap:6px;margin-top:auto">
-        ${m.imdb_url?`<a class="trailer" style="flex:0 0 auto;background:#f5c518;color:#000" href="${esc(m.imdb_url)}" target="_blank" rel="noopener">IMDb</a>`:''}
         <a class="trailer" style="flex:1" href="${esc(m.trailer)}" target="_blank" rel="noopener">Trailer</a>
         ${playBtn(m)}
       </div>
