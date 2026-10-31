@@ -81,6 +81,8 @@ this laptop's `~/Downloads` is picked up, so copy a fix file over by hand.
   genre, runtime, seasons, "Added in <year>", director, actors and plot.
 - **Click the poster** for a larger view with the full plot.
 - **▶ Play** opens the video in VLC (see below).
+- **✓ Mark watched** / **↺ Mark unwatched** move the title into or out of `_watched/`
+  (see below).
 
 ### ✓ Subs
 
@@ -115,6 +117,21 @@ folder plays its largest video; a series folder opens whole, so VLC queues the e
 - The handler only opens paths inside the library folders, since any web page could
   fire a `movies-play://` link. When the NAS can't be reached it shows a desktop
   notification.
+
+### ✓ Mark watched / ↺ Mark unwatched
+
+✓ Mark watched moves **every copy** of a title that isn't in `_watched/` yet into the
+`_watched/` folder of its own base (local `~/Videos`, Saronic, WD); ↺ Mark unwatched moves
+the copies in `_watched/` back out. A title with copies on both sides (local unwatched,
+NAS watched) shows both buttons. Each asks to confirm, then the card updates at once.
+
+- They reuse the Play handler: no setup beyond `--install-handler`, and they only work on
+  the machine that has it.
+- Each move is appended to `renames.log` (`watched`/`unwatched` kind, old and new path).
+  A copy whose destination already exists is left where it is and reported.
+- The page is rebuilt and republished 15 s after the **last** mark, so marking several
+  titles in a row costs one rebuild. That needs `OMDB_API_KEY` exported from `~/.bashrc`.
+  A desktop notification says what moved, then "Page rebuilt".
 
 ## Data files
 
@@ -170,7 +187,7 @@ sweep covers every matched title, so a wrong match renames a real folder to the 
 - **Skipped:** unmatched titles, name collisions, and targets that already exist.
 
 `renames.log` is the undo trail, appended after each rename and never read by the
-program. One tab-separated line per rename: time, `local`/`remote`, old path, new path.
+program. One tab-separated line per rename: time, `local`/`remote`/`watched`/`unwatched`, old path, new path.
 
 ```
 2026-10-18 12:45:14	local	/home/tanman/Videos/Anatomy-Of-A-Fall_(2024)	/home/tanman/Videos/Anatomy-of-a-Fall_(2024)

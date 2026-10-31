@@ -18,6 +18,7 @@ Fixing a wrong or missing match:
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -822,6 +823,10 @@ HTML = """<!doctype html>
   a.play{margin-top:auto;text-align:center;padding:8px;border-radius:8px;
     background:#15803d;color:#fff;text-decoration:none;font-size:13px}
   a.play:hover{filter:brightness(1.2)}  /* same green, a touch lighter */
+  a.watch{align-self:center;text-align:center;padding:4px 6px;border-radius:6px;
+    background:transparent;border:1px solid #363b47;color:#e8e8e8;text-decoration:none;
+    font-size:11px;white-space:nowrap}  /* secondary: smaller, so ▶ Play gets the width */
+  a.watch:hover{background:#262b36}
   .sep{width:1px;height:24px;background:#2c303a;align-self:center}
   label.cb{display:flex;align-items:center;gap:5px;font-size:13px;cursor:pointer;white-space:nowrap}
   label.cb input{accent-color:#6ee7b7;width:15px;height:15px;cursor:pointer}
@@ -1005,6 +1010,31 @@ function playBtn(m){
   const href='movies-play://play?src='+encodeURIComponent(src)+'&path='+encodeURIComponent(path);
   return `<a class="play" style="flex:1" href="${esc(href)}" title="Play in VLC (${esc(src)})">▶ Play</a>`;
 }
+// ✓ Mark watched / ↺ Mark unwatched: the handler moves the copies into (out of) their base's
+// _watched/ and rebuilds the page. A title can have copies on both sides: each button moves
+// only the copies that aren't there yet, so a mixed title shows both.
+const inW=p=>p[1].endsWith('/_watched');
+function watchBtn(m,i,act){
+  const ps=m.paths.filter(p=>inW(p)===(act==='unwatched'));
+  if(!ps.length)return '';
+  const href='movies-play://'+act+'?'+ps.map(p=>'src='+encodeURIComponent(p[0])+'&path='+encodeURIComponent(p[1]+'/'+p[2])).join('&');
+  const [tip,txt]=act==='watched'?['Move to _watched','✓ Mark watched']:['Move out of _watched','↺ Mark unwatched'];
+  return `<a class="watch" href="${esc(href)}" title="${tip}" onclick="return watchGo(${i},'${act}')">${txt}</a>`;
+}
+function watchGo(i,act){
+  const m=CURRENT_ROWS[i], w=act==='watched';
+  if(!confirm('Move "'+m.title+'" '+(w?'to':'out of')+' _watched?'))return false;
+  setTimeout(()=>{  // after the browser has followed the link: show the moved state now
+    for(const p of m.paths){
+      if(inW(p)===w)continue;
+      const old=p[1], nb=w?old+'/_watched':old.slice(0,-9), f=old+'/'+p[2];
+      for(const q of m.play||[])if(q[0]===p[0]&&(q[1]===f||q[1].startsWith(f+'/')))q[1]=nb+q[1].slice(old.length);
+      p[1]=nb;
+    }
+    m.watched=m.paths.some(inW);render();
+  },0);
+  return true;
+}
 // the 🍅 rating opens the film's RT page (ID from Wikidata), else an RT search
 function ratings(m){
   const ext=(href,cls,txt,tip)=>`<a class="b ${cls}" href="${esc(href)}" target="_blank" rel="noopener" title="${tip}">${txt}</a>`;
@@ -1058,8 +1088,8 @@ function card(m,i){
       ${m.director?`<div class="meta">Dir: ${esc(m.director)}</div>`:''}
       ${m.actors?`<div class="meta">${esc(m.actors)}</div>`:''}
       ${m.plot&&m.plot!=='N/A'?`<details class="plot"><summary></summary><p>${esc(m.plot)}</p></details>`:''}
-      <div style="display:flex;gap:6px;margin-top:auto">
-        ${playBtn(m)}
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:auto">
+        ${playBtn(m)}${watchBtn(m,i,'watched')}${watchBtn(m,i,'unwatched')}
       </div>
     </div></div>`;
 }
@@ -1367,7 +1397,7 @@ def _search_selftest():
 
 
 def selftest():
-    global SARONIC_IP
+    global SARONIC_IP, HERE, CORRECTIONS_FILE, VIDEOS, _rebuild, _notify, REBUILD_DELAY, REBUILD_STAMP
     SARONIC_IP = SARONIC_IP or "nas.invalid"  # dry run only, never dialled
     cases = [
         ("Anora 2024 1080p WEB-DL HEVC x265 5.1 BONE", ("Anora", "2024", "movie")),
@@ -1624,7 +1654,6 @@ def selftest():
     assert build_entry("r", "T", None, "movie", hit)["orig"] == ""  # same: not shown
 
     # a real rename saves the moved correction and the log as it goes, not at the end
-    global HERE, CORRECTIONS_FILE
     saved = HERE, CORRECTIONS_FILE
     with tempfile.TemporaryDirectory() as td:
         HERE, CORRECTIONS_FILE = Path(td), Path(td) / "corrections.json"
@@ -1638,6 +1667,74 @@ def selftest():
             "Faithless_(2000)": {"imdb_id": "tt0157122"}}
         assert "Faithless_(2000)" in (Path(td) / "renames.log").read_text()
     HERE, CORRECTIONS_FILE = saved
+
+    V = str(VIDEOS)
+    sar, wd = "~/Videos/movies", "/volumeUSB1/usbshare/Videos"
+    assert watched_target("Local", V + "/X_(2000)") == V + "/_watched/X_(2000)"
+    assert watched_target("Saronic", sar + "/X") == sar + "/_watched/X"
+    assert watched_target("WD", wd + "/X") == wd + "/_watched/X"
+    for bad in ("X\x00", "X\nY", "X\tY"):
+        assert watched_target("Saronic", f"{sar}/{bad}") is None, bad
+        assert watched_target("Local", f"{V}/{bad}") is None, bad
+    for s, p in [("Local", V + "/_watched/X"), ("Saronic", sar + "/_watched/X"),
+                 ("Saronic", wd + "/X"), ("Local", sar + "/X"), ("Local", V + "/a/b"),
+                 ("Local", V + "/.."), ("Local", V + "/_watched"), ("Local", V + "/"),
+                 ("Local", "/etc/passwd"), ("Nope", V + "/X")]:
+        assert watched_target(s, p) is None, (s, p)
+    # Mark unwatched: the reverse, only from a _watched/ base of that source
+    assert watched_target("Local", V + "/_watched/X", True) == V + "/X"
+    assert watched_target("Saronic", sar + "/_watched/X", True) == sar + "/X"
+    assert watched_target("WD", wd + "/_watched/X", True) == wd + "/X"
+    for s, p in [("Local", V + "/X"), ("Saronic", sar + "/X"), ("WD", sar + "/_watched/X"),
+                 ("Local", V + "/_watched/_watched"), ("Local", V + "/_watched/a/b"),
+                 ("Saronic", sar + "/_watched/X\x00")]:
+        assert watched_target(s, p, True) is None, (s, p)
+
+    # local Mark-watched round trip in a temp dir (rebuild and notifications stubbed)
+    saved = VIDEOS, HERE, _rebuild, _notify, REBUILD_DELAY, REBUILD_STAMP
+    calls = []
+    with tempfile.TemporaryDirectory() as td:
+        VIDEOS, HERE = Path(td), Path(td)
+        REBUILD_DELAY, REBUILD_STAMP = 0, Path(td) / "stamp"
+        _rebuild = lambda: calls.append(1) or subprocess.CompletedProcess([], 0, "", "")
+        notes = []
+        _notify = notes.append
+        try:
+            (Path(td) / "F_(2000)").write_text("x")
+            (Path(td) / "D_(2001)").mkdir()
+            mark_watched([("Local", f"{td}/F_(2000)"), ("Local", f"{td}/D_(2001)")])
+            assert (Path(td) / "_watched/F_(2000)").is_file()
+            assert (Path(td) / "_watched/D_(2001)").is_dir()
+            assert not (Path(td) / "F_(2000)").exists() and calls == [1]
+            assert (Path(td) / "renames.log").read_text().count("\twatched\t") == 2
+            (Path(td) / "F_(2000)").write_text("y")  # destination already exists: stays put
+            log_lines = (Path(td) / "renames.log").read_text().count("\n")
+            try:
+                mark_watched([("Local", f"{td}/F_(2000)")])
+                raise AssertionError("expected exit")
+            except SystemExit:
+                pass
+            assert (Path(td) / "F_(2000)").read_text() == "y" and calls == [1]
+            assert "destination exists" in notes[-1], notes[-1]
+            assert (Path(td) / "_watched/F_(2000)").read_text() == "x"
+            assert (Path(td) / "renames.log").read_text().count("\n") == log_lines
+            mark_watched([("Local", f"{td}/_watched/D_(2001)")], back=True)  # unwatch
+            assert (Path(td) / "D_(2001)").is_dir() and calls == [1, 1]
+            assert not (Path(td) / "_watched/D_(2001)").exists()
+            assert "\tunwatched\t" in (Path(td) / "renames.log").read_text()
+            # marks in quick succession share one rebuild: only the last one runs it
+            import threading
+            calls.clear()
+            REBUILD_DELAY = 0.4
+            ts = [threading.Thread(target=_rebuild_soon) for _ in range(3)]
+            for t in ts:
+                t.start()
+                time.sleep(0.1)
+            for t in ts:
+                t.join()
+            assert calls == [1], calls
+        finally:
+            VIDEOS, HERE, _rebuild, _notify, REBUILD_DELAY, REBUILD_STAMP = saved
     print(f"selftest: {len(cases)} cases passed")
 
 
@@ -1690,14 +1787,18 @@ def _notify(msg):
     print(msg, file=sys.stderr)
     try:  # launched from the browser: stderr goes nowhere
         subprocess.run(["notify-send", "Movies DB", msg], timeout=5)
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, ValueError):
         pass
 
 
 def play(url):
-    """--play: the movies-play:// handler. Opens the copy in VLC, detached."""
+    """--play: the movies-play:// handler. movies-play://play opens the copy in VLC,
+    detached; movies-play://watched (unwatched) moves the copies to (out of) _watched/."""
     u = urllib.parse.urlsplit(url)
     q = urllib.parse.parse_qs(u.query)
+    if u.scheme == "movies-play" and u.netloc in ("watched", "unwatched"):
+        pairs = list(zip(q.get("src", []), q.get("path", [])))
+        return mark_watched(pairs, back=u.netloc == "unwatched")
     src, path = (q.get(k, [""])[0] for k in ("src", "path"))
     target = play_target(src, path) if u.scheme == "movies-play" else None
     if not target:
@@ -1713,6 +1814,110 @@ def play(url):
                          stderr=subprocess.DEVNULL)
     except OSError as e:
         _notify(f"Couldn't start VLC: {e}")
+        sys.exit(1)
+
+
+def watched_target(src, path, back=False):
+    """Where a Mark-watched link moves a copy: <its base>/_watched/<name>; with back (Mark
+    unwatched), <base>/_watched/<name> -> <base>/<name>. None unless it's a direct child of
+    a library base for that source on the right side of _watched. Pure, no I/O."""
+    if "/" not in path:
+        return None
+    parent, name = path.rsplit("/", 1)
+    if (not name or name in (".", "..", "_watched") or name.startswith(".")
+            or any(ord(c) < 32 or c == "\x7f" for c in name)):
+        return None
+    if src == "Local":
+        ok = parent == str(VIDEOS / "_watched" if back else VIDEOS)
+    else:
+        ok = any(parent == b for b, s, w in REMOTE_DIRS if s == src and w == back)
+    if not ok:
+        return None
+    return f"{parent.rsplit('/', 1)[0]}/{name}" if back else f"{parent}/_watched/{name}"
+
+
+REBUILD_DELAY = 15  # s; marks clicked within this of each other share one rebuild
+REBUILD_STAMP = Path(tempfile.gettempdir()) / f"movies-db-rebuild-{os.getuid()}"
+
+
+def _rebuild():
+    """Re-run this program via an interactive bash so .bashrc supplies OMDB_API_KEY."""
+    return subprocess.run(["bash", "-ic", 'exec "$0"', str(Path(sys.argv[0]).absolute())],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=600)
+
+
+def _rebuild_soon():
+    """Debounced _rebuild: each mark stamps a token, waits REBUILD_DELAY, and rebuilds only
+    if no later mark re-stamped meanwhile (that one rebuilds instead; returns None here).
+    The lock keeps two rebuilds from writing the page/cache at once: a mark landing during
+    a rebuild waits for it, then rebuilds again with its own move included."""
+    token = f"{os.getpid()} {time.time()}"
+    REBUILD_STAMP.write_text(token)
+    time.sleep(REBUILD_DELAY)
+    if REBUILD_STAMP.read_text() != token:
+        return None
+    with open(f"{REBUILD_STAMP}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _rebuild()
+
+
+def mark_watched(pairs, back=False):
+    """--play movies-play://watched?... (unwatched?... with back): move each copy into (out
+    of) its base's _watched/, logged to renames.log, then rebuild and republish the page."""
+    kind = "unwatched" if back else "watched"
+    dsts = [watched_target(s, p, back) for s, p in pairs]
+    if not pairs or None in dsts:
+        _notify("Not in the library: " + ", ".join(f"{s} {p}" for s, p in pairs))
+        sys.exit(1)
+    moved, failed = [], []
+    for (src, path), dst in zip(pairs, dsts):
+        try:
+            if src == "Local":
+                if not os.path.exists(path):
+                    raise OSError("missing")
+                if os.path.exists(dst):
+                    raise OSError("destination exists")
+                Path(dst).parent.mkdir(exist_ok=True)
+                Path(path).rename(dst)
+            elif not SARONIC_IP:
+                raise OSError("SARONIC_IP is empty")
+            else:
+                parent = dst.rsplit("/", 1)[0]
+                cmd = (f"test -e {rq(path)} && test ! -e {rq(dst)} && "
+                       f"mkdir -p {rq(parent)} && mv {rq(path)} {rq(dst)}")
+                subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                                SARONIC_IP, cmd], check=True, timeout=30, capture_output=True)
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
+            if isinstance(e, subprocess.CalledProcessError):
+                err = [l for l in (e.stderr or b"").decode(errors="replace").splitlines()
+                       if l.strip()]
+                e = err[-1] if err else (f"exit {e.returncode}" if e.returncode != 1 else
+                                         "destination exists or source missing")
+            failed.append(f"{src} {path}: {e}")
+            continue
+        moved.append(src)
+        with (HERE / "renames.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%F %T}\t{kind}\t{path}\t{dst}\n")
+    msg = []
+    if moved:
+        msg.append(f"Moved {'out of' if back else 'to'} _watched: " + ", ".join(moved)
+                   + f"; page rebuild in {REBUILD_DELAY} s")
+    msg += [f"Failed: {f}" for f in failed]
+    _notify("; ".join(msg))  # now, not after the wait: the move is what was clicked
+    if not moved:
+        sys.exit(1)
+    try:
+        r = _rebuild_soon()
+        if r is not None:
+            err = [l for l in r.stderr.splitlines() if l.strip()]
+            if r.returncode:
+                raise OSError(err[-1] if err else f"exit {r.returncode}")
+            _notify("Page rebuilt")
+    except (subprocess.SubprocessError, OSError) as e:
+        _notify(f"Page rebuild failed: {e}; run movies-db")
+        sys.exit(1)
+    if failed:
         sys.exit(1)
 
 
