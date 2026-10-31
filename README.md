@@ -13,7 +13,7 @@ extras from [Wikidata](https://www.wikidata.org/), and writes a static gallery t
 - Optional: `ffprobe` locally (from ffmpeg) for embedded-subtitle detection, and VLC for
   the ▶ Play buttons.
 
-`~/.local/bin/movies-db` is a symlink to `build.py`, so it runs as `movies-db` from
+`/usr/local/bin/movies-db` is a symlink to `build.py`, so it runs as `movies-db` from
 anywhere. `cache.json`, `corrections.json` and `renames.log` always live in this repo,
 whichever way it's invoked: the symlink is resolved.
 
